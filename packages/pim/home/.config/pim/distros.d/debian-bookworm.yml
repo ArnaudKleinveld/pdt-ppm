@@ -1,0 +1,35 @@
+# Debian 12 (Bookworm) Distro Configuration
+
+debian/bookworm:
+  slug: debian-bookworm
+  iso_key: debian-12-amd64-netinst
+  boot:
+    command:
+      - "<esc><wait>"
+      - "auto preseed/url={{ http_url }}/debian-preseed.cfg<wait>"
+      - "<enter>"
+    wait: "6s"
+  preseed:
+    template: debian-preseed.cfg.pkrtpl
+  build_vars:
+    # Debian preseed defaults
+    debian_preseed_country: US
+    debian_preseed_file: "debian-preseed.cfg"
+    debian_preseed_keyboard_keymap: us
+    debian_preseed_language: en
+    debian_preseed_locale: "en_US.UTF-8"
+    debian_preseed_mirror_http_hostname: "deb.debian.org"
+    debian_preseed_pkgsel_include: []
+    debian_preseed_timezone: "UTC"
+
+    # Distro ISO info (can be overridden)
+    distro_iso_checksum: "f4f7de1665cdcd00b2e526da6876f3e06a37da3549e9f880602f64407f602983a571c142eb0de0eacfc9c1d0f534e9339cdce04eb9daddc6ddfa8cf34853beed"
+    distro_iso_file: "debian-12.8.0-amd64-netinst.iso"
+    distro_iso_url: "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.8.0-amd64-netinst.iso"
+  provisioners:
+    - debian-cloud
+  hcl_files:
+    - variables.pkr.hcl
+    - locals.pkr.hcl
+    - sources.pkr.hcl
+    - provisioners.pkr.hcl

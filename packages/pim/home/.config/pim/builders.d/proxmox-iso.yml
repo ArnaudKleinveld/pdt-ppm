@@ -1,0 +1,28 @@
+# Proxmox ISO Builder
+# Build Proxmox VM templates from ISO images
+
+proxmox-iso:
+  type: proxmox-iso
+  plugins:
+    proxmox:
+      version: ">= 1.2.0"
+      source: "github.com/hashicorp/proxmox"
+  build_vars:
+    # Proxmox connection defaults
+    proxmox_port: 8006
+    proxmox_skip_verify_tls: false
+
+    # VM hardware defaults
+    proxmox_cores: 1
+    proxmox_sockets: 1
+    proxmox_memory: 1024
+    proxmox_disk_size: "4G"
+    proxmox_disk_format: "raw"
+    proxmox_disk_type: "scsi"
+    proxmox_disk_storage_pool: "local-lvm"
+    proxmox_network_bridge: "vmbr0"
+    proxmox_iso_storage_pool: "local"
+  hcl_files:
+    - variables.pkr.hcl
+    - locals.pkr.hcl
+    - sources.pkr.hcl
