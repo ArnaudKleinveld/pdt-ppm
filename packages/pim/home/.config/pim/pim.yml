@@ -13,3 +13,10 @@ serve:
 iso:
   # Directory where ISOs are downloaded/cached
   iso_dir: $XDG_CACHE_HOME/pim/isos
+
+ventoy:
+  version: v1.0.99
+  dir: ventoy-1.0.99
+  file: ventoy-1.0.99-linux.tar.gz
+  checksum: sha256:467cdd188a7f739bc706adbc1d695f61ffdefc95916adb015947d80829f00a3d
+  # device: /dev/sda              # Default device (optional, overridable per command)

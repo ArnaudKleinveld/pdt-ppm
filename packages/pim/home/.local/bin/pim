@@ -10,8 +10,9 @@ require 'pathname'
 require 'fileutils'
 
 # Load subcommand libraries
-require 'pim-iso'
-require 'pim-profile'
+require 'pim/iso'
+require 'pim/profile'
+require 'pim/ventoy'
 
 module Pim
   # Deep merge utility for configuration hashes
@@ -312,6 +313,9 @@ module Pim
 
     desc 'profile SUBCOMMAND', 'Profile management commands'
     subcommand 'profile', PimProfile::CLI
+
+    desc 'ventoy SUBCOMMAND', 'Ventoy USB boot management'
+    subcommand 'ventoy', PimVentoy::CLI
   end
 end
 
