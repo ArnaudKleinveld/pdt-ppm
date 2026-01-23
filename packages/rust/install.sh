@@ -5,9 +5,9 @@ dependencies() {
 }
 
 post_install() {
-  source <(mise activate zsh)
+  source <(mise activate bash)
   mise install rust
 
-  source <(mise activate zsh)
+  source <(mise activate bash)
   rustup component add rust-analyzer
 }
