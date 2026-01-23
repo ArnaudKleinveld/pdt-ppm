@@ -134,10 +134,11 @@ module Pim
 
   # WEBrick server for serving preseed and post-install scripts
   class Server
-    def initialize(profile:, port: 8080, verbose: false, preseed_name: nil, install_name: nil)
+    def initialize(profile:, port: 8080, verbose: false, debug: false, preseed_name: nil, install_name: nil)
       @profile = profile
       @port = port
       @verbose = verbose
+      @debug = debug
       @preseed_name = preseed_name
       @install_name = install_name
       @ip = local_ip
@@ -161,6 +162,22 @@ module Pim
       puts "Preseed URL:      http://#{@ip}:#{@port}#{preseed_path}"
       puts "Install URL:      http://#{@ip}:#{@port}#{install_path}" if install_content
       puts
+
+      if @debug
+        puts '=' * 60
+        puts "preseed.cfg:"
+        puts '=' * 60
+        puts preseed_content
+        puts
+        if install_content
+          puts '=' * 60
+          puts "install.sh:"
+          puts '=' * 60
+          puts install_content
+          puts
+        end
+      end
+
       puts "Boot parameters:"
       puts "  auto=true priority=critical preseed/url=http://#{@ip}:#{@port}#{preseed_path}"
       puts
@@ -232,6 +249,7 @@ module Pim
     option :preseed, type: :string, aliases: '-p', desc: 'Preseed template name (default: profile name)'
     option :install, type: :string, aliases: '-i', desc: 'Post-install script name (default: profile name)'
     option :verbose, type: :boolean, default: false, aliases: '-v', desc: 'Verbose output'
+    option :debug, type: :boolean, default: false, aliases: '-d', desc: 'Show preseed and install file contents'
     def serve(profile_name = nil)
       config = Config.new
 
@@ -261,6 +279,7 @@ module Pim
         profile: profile,
         port: options[:port],
         verbose: options[:verbose],
+        debug: options[:debug],
         preseed_name: options[:preseed],
         install_name: options[:install]
       )
