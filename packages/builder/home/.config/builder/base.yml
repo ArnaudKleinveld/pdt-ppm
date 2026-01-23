@@ -1,6 +1,0 @@
-username: ansible
-password: ansible
-authorized_keys_url: https://github.com/rjayroach.keys
-hostname: debian-base
-domain: local
-timezone: Asia/Singapore

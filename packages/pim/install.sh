@@ -2,10 +2,11 @@
 
 dependencies() {
   echo "ruby"
+  # echo "ruby packer podman utm"
 }
 
 install_linux() {
-  sudo apt-get install -y xz-utils fdisk parted dosfstools expect exfat-fuse exfat-utils
+  install_dep xz-utils fdisk parted dosfstools expect exfat-fuse exfat-utils
 }
 
 post_install() {
@@ -13,8 +14,8 @@ post_install() {
   gem install webrick thor
 
   # Download and extract Ventoy (config from pim.yml)
-  local config_file="$HOME/.config/pim/pim.yml"
-  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/pim/ventoy"
+  local config_file="$XDG_CONFIG_HOME/pim/pim.yml"
+  local cache_dir="$XDG_CACHE_HOME/pim/ventoy"
 
   # Parse ventoy config from YAML using Ruby (already installed as dependency)
   local ventoy_version ventoy_dir ventoy_file ventoy_checksum
