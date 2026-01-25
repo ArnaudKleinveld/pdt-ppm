@@ -1,0 +1,20 @@
+# PIM UTM Target
+# Package qcow2 for UTM (macOS QEMU wrapper)
+
+utm:
+  builder: qcow2-convert
+
+  # Output directory for .utm bundles
+  utm_output_dir: ~/Documents/UTM
+
+  # UTM VM settings
+  utm_architecture: x86_64
+  utm_machine: q35
+  utm_cpu: host
+
+  # Display
+  utm_display: virtio-vga
+
+  # Network
+  utm_network: virtio-net-pci
+  utm_network_mode: shared

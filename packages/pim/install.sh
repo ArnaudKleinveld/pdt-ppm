@@ -9,6 +9,10 @@ install_linux() {
   install_dep xz-utils fdisk parted dosfstools expect exfat-fuse exfat-utils
 }
 
+install_macos() {
+  install_dep qemu
+}
+
 post_install() {
   source <(mise activate bash)
   gem install webrick thor
@@ -16,6 +20,9 @@ post_install() {
   # Download and extract Ventoy (config from pim.yml)
   local config_file="$XDG_CONFIG_HOME/pim/pim.yml"
   local cache_dir="$XDG_CACHE_HOME/pim/ventoy"
+}
+
+xyzlm() {
 
   # Parse ventoy config from YAML using Ruby (already installed as dependency)
   local ventoy_version ventoy_dir ventoy_file ventoy_checksum

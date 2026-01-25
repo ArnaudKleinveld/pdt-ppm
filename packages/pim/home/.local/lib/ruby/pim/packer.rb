@@ -2,11 +2,12 @@
 
 require 'yaml'
 require 'pathname'
+require 'digest'
 require 'fileutils'
 require 'erb'
+require 'open3'
 require 'thor'
 require 'json'
-require 'open3'
 
 module PimPacker
   # Deep merge utility for configuration hashes
@@ -27,170 +28,49 @@ module PimPacker
     end
   end
 
-  # Configuration loader for pim packer
-  class Config
+  # Configuration loader for targets
+  class TargetConfig
     XDG_CONFIG_HOME = ENV.fetch('XDG_CONFIG_HOME', File.expand_path('~/.config'))
     GLOBAL_CONFIG_DIR = File.join(XDG_CONFIG_HOME, 'pim')
-    GLOBAL_TEMPLATES_DIR = File.join(GLOBAL_CONFIG_DIR, 'templates', 'packer')
-
-    BUILDERS_D = File.join(GLOBAL_CONFIG_DIR, 'builders.d')
-    DISTROS_D = File.join(GLOBAL_CONFIG_DIR, 'distros.d')
-    BUILDS_D = File.join(GLOBAL_CONFIG_DIR, 'builds.d')
-    PROVISIONERS_D = File.join(GLOBAL_CONFIG_DIR, 'provisioners.d')
-
-    attr_reader :runtime_config, :project_dir
+    GLOBAL_CONFIG_D = File.join(GLOBAL_CONFIG_DIR, 'targets.d')
 
     def initialize(project_dir: Dir.pwd)
       @project_dir = project_dir
-      @runtime_config = load_runtime_config
-      @builders = nil
-      @distros = nil
-      @builds = nil
-      @provisioners = nil
+      @targets = load_targets
     end
 
-    def packer_config
-      @runtime_config['packer'] || {}
+    def targets
+      @targets
     end
 
-    def builds_dir
-      packer_config['builds_dir'] || '.builds'
+    def target(name)
+      name = name.to_s
+      default_target = @targets['default'] || {}
+
+      if name == 'default' || name.empty?
+        default_target
+      else
+        DeepMerge.merge(default_target, @targets[name] || {})
+      end
     end
 
-    def default_plugins
-      packer_config['plugins'] || {}
-    end
-
-    def default_build_vars
-      packer_config['build_vars'] || {}
-    end
-
-    # Load builders from builders.d/*.yml
-    def builders
-      @builders ||= load_from_d(BUILDERS_D, 'builders.d')
-    end
-
-    # Load distros from distros.d/*.yml
-    def distros
-      @distros ||= load_from_d(DISTROS_D, 'distros.d')
-    end
-
-    # Load builds from builds.d/*.yml
-    def builds
-      @builds ||= load_from_d(BUILDS_D, 'builds.d')
-    end
-
-    # Load provisioners from provisioners.d/*.yml
-    def provisioners
-      @provisioners ||= load_from_d(PROVISIONERS_D, 'provisioners.d')
-    end
-
-    def builder(name)
-      builders[name] || {}
-    end
-
-    def distro(name)
-      distros[name] || {}
-    end
-
-    def build(name)
-      builds[name] || {}
-    end
-
-    def provisioner(name)
-      provisioners[name] || {}
-    end
-
-    def builder_names
-      builders.keys.sort
-    end
-
-    def distro_names
-      distros.keys.sort
-    end
-
-    def build_names
-      builds.keys.sort
-    end
-
-    def provisioner_names
-      provisioners.keys.sort
-    end
-
-    # Find template file - project first, then global
-    def find_template(subpath)
-      # 1. Project directory
-      project_path = File.join(@project_dir, 'templates', 'packer', subpath)
-      return project_path if File.exist?(project_path)
-
-      # 2. Global config directory
-      global_path = File.join(GLOBAL_TEMPLATES_DIR, subpath)
-      return global_path if File.exist?(global_path)
-
-      nil
-    end
-
-    # Find HCL file for builder/distro
-    def find_hcl(type, name, filename)
-      base_dir = case type
-                 when :builder then BUILDERS_D
-                 when :distro then DISTROS_D
-                 else raise "Unknown type: #{type}"
-                 end
-
-      # Check in the .d directory with name prefix
-      hcl_path = File.join(base_dir, name.tr('/', '-'), filename)
-      return hcl_path if File.exist?(hcl_path)
-
-      # Project directory
-      project_path = File.join(@project_dir, type.to_s + 's', name, filename)
-      return project_path if File.exist?(project_path)
-
-      nil
+    def target_names
+      @targets.keys.reject { |k| k == 'default' }.sort
     end
 
     private
 
-    def load_runtime_config
-      config = {}
+    def load_targets
+      targets = {}
 
-      # Global pim.yml
-      global_file = File.join(GLOBAL_CONFIG_DIR, 'pim.yml')
-      config = DeepMerge.merge(config, load_yaml(global_file))
-
-      # Project pim.yml
-      project_file = File.join(@project_dir, 'pim.yml')
-      config = DeepMerge.merge(config, load_yaml(project_file))
-
-      # Project packer.yml (convenience)
-      packer_file = File.join(@project_dir, 'packer.yml')
-      if File.exist?(packer_file)
-        packer_config = load_yaml(packer_file)
-        config['packer'] = DeepMerge.merge(config['packer'] || {}, packer_config)
+      load_targets_d(GLOBAL_CONFIG_D).each do |fragment|
+        targets = DeepMerge.merge(targets, fragment)
       end
 
-      config
-    end
+      project_file = File.join(@project_dir, 'targets.yml')
+      targets = DeepMerge.merge(targets, load_yaml(project_file))
 
-    def load_from_d(global_dir, project_subdir)
-      items = {}
-
-      # Load from global .d directory
-      if Dir.exist?(global_dir)
-        Dir.glob(File.join(global_dir, '*.yml')).sort.each do |file|
-          items = DeepMerge.merge(items, load_yaml(file))
-        end
-      end
-
-      # Load from project directory
-      project_d = File.join(@project_dir, project_subdir)
-      if Dir.exist?(project_d)
-        Dir.glob(File.join(project_d, '*.yml')).sort.each do |file|
-          items = DeepMerge.merge(items, load_yaml(file))
-        end
-      end
-
-      items
+      targets
     end
 
     def load_yaml(path)
@@ -200,721 +80,1005 @@ module PimPacker
       warn "Warning: Failed to parse #{path}: #{e.message}"
       {}
     end
-  end
 
-  # Builder model
-  class Builder
-    attr_reader :name, :data
+    def load_targets_d(dir)
+      return [] unless Dir.exist?(dir)
 
-    def initialize(name, data)
-      @name = name
-      @data = data || {}
-    end
-
-    def type
-      @data['type'] || @name
-    end
-
-    def plugins
-      @data['plugins'] || {}
-    end
-
-    def build_vars
-      @data['build_vars'] || {}
-    end
-
-    def hcl_files
-      @data['hcl_files'] || %w[variables.pkr.hcl locals.pkr.hcl sources.pkr.hcl]
-    end
-
-    def to_h
-      @data
-    end
-  end
-
-  # Distro model
-  class Distro
-    attr_reader :name, :data
-
-    def initialize(name, data)
-      @name = name
-      @data = data || {}
-    end
-
-    def slug
-      @data['slug'] || @name.tr('/', '-')
-    end
-
-    def iso_key
-      @data['iso_key']
-    end
-
-    def build_vars
-      @data['build_vars'] || {}
-    end
-
-    def boot_command
-      @data.dig('boot', 'command')
-    end
-
-    def boot_wait
-      @data.dig('boot', 'wait') || '6s'
-    end
-
-    def preseed_template
-      @data.dig('preseed', 'template')
-    end
-
-    def hcl_files
-      @data['hcl_files'] || %w[variables.pkr.hcl locals.pkr.hcl sources.pkr.hcl provisioners.pkr.hcl]
-    end
-
-    def provisioners
-      @data['provisioners'] || []
-    end
-
-    def to_h
-      @data
-    end
-  end
-
-  # Provisioner model
-  class Provisioner
-    attr_reader :name, :data
-
-    def initialize(name, data)
-      @name = name
-      @data = data || {}
-    end
-
-    def type
-      @data['type'] || 'shell'
-    end
-
-    def config
-      @data['config'] || {}
-    end
-
-    def to_h
-      @data
-    end
-  end
-
-  # Build model - combines distros, builders, and provisioners
-  class Build
-    attr_reader :name, :data, :config
-
-    def initialize(name, data, config)
-      @name = name
-      @data = data || {}
-      @config = config
-    end
-
-    def build_vars
-      @data['build_vars'] || {}
-    end
-
-    def distro_names
-      (@data['distros'] || {}).keys
-    end
-
-    def builder_names
-      (@data['builders'] || {}).keys
-    end
-
-    def provisioner_names
-      @data['provisioners'] || []
-    end
-
-    def distro_overrides(distro_name)
-      @data.dig('distros', distro_name) || {}
-    end
-
-    def builder_overrides(builder_name)
-      @data.dig('builders', builder_name) || {}
-    end
-
-    # Resolve merged build_vars for a specific distro/builder combination
-    def resolve_vars(distro_name, builder_name, cli_vars = {})
-      vars = {}
-
-      # 1. Global packer.yml build_vars (lowest precedence)
-      vars = DeepMerge.merge(vars, @config.default_build_vars)
-
-      # 2. Builder build_vars
-      builder = Builder.new(builder_name, @config.builder(builder_name))
-      vars = DeepMerge.merge(vars, builder.build_vars)
-
-      # 3. Distro build_vars
-      distro = Distro.new(distro_name, @config.distro(distro_name))
-      vars = DeepMerge.merge(vars, distro.build_vars)
-
-      # 4. Build build_vars
-      vars = DeepMerge.merge(vars, build_vars)
-
-      # 5. Build-level distro overrides
-      vars = DeepMerge.merge(vars, distro_overrides(distro_name).fetch('build_vars', {}))
-
-      # 6. Build-level builder overrides
-      vars = DeepMerge.merge(vars, builder_overrides(builder_name).fetch('build_vars', {}))
-
-      # 7. CLI --var overrides (highest precedence)
-      vars = DeepMerge.merge(vars, cli_vars)
-
-      vars
-    end
-
-    # Collect all plugins needed for this build
-    def resolve_plugins(builder_name)
-      plugins = {}
-
-      # Global plugins
-      plugins = DeepMerge.merge(plugins, @config.default_plugins)
-
-      # Builder plugins
-      builder = Builder.new(builder_name, @config.builder(builder_name))
-      plugins = DeepMerge.merge(plugins, builder.plugins)
-
-      plugins
-    end
-
-    def to_h
-      @data
-    end
-  end
-
-  # HCL Renderer - generates HCL files from ERB templates
-  class HclRenderer
-    def initialize(config)
-      @config = config
-    end
-
-    # Render an ERB template with the given bindings
-    def render_template(template_path, bindings)
-      return nil unless template_path && File.exist?(template_path)
-
-      template_content = File.read(template_path)
-      template = ERB.new(template_content, trim_mode: '-')
-      template.result_with_hash(bindings)
-    end
-
-    # Render the main build.pkr.hcl file
-    def render_build_hcl(build:, distro:, builder:, plugins:, sources_content:, provisioners_content:)
-      bindings = {
-        template_run_date: Time.now.strftime('%Y-%m-%d %H:%M:%S'),
-        plugins: plugins,
-        sources_content: sources_content,
-        provisioners_content: provisioners_content,
-        build: build,
-        distro: distro,
-        builder: builder
-      }
-
-      template_path = @config.find_template('build.pkr.hcl.erb')
-      render_template(template_path, bindings)
-    end
-
-    # Render the pkrvars.hcl file with variable values
-    def render_pkrvars_hcl(build_vars)
-      bindings = {
-        template_run_date: Time.now.strftime('%Y-%m-%d %H:%M:%S'),
-        build_vars: build_vars
-      }
-
-      template_path = @config.find_template('build.pkrvars.hcl.erb')
-      render_template(template_path, bindings)
-    end
-
-    # Format a value for HCL output
-    def self.format_hcl_value(value)
-      case value
-      when true, false
-        value.to_s
-      when Integer, Float
-        value.to_s
-      when Array
-        "[#{value.map { |v| format_hcl_value(v) }.join(', ')}]"
-      when Hash
-        pairs = value.map { |k, v| "#{k} = #{format_hcl_value(v)}" }
-        "{\n  #{pairs.join("\n  ")}\n}"
-      when nil
-        'null'
-      else
-        # String - escape and quote
-        "\"#{value.to_s.gsub('\\', '\\\\\\\\').gsub('"', '\\"')}\""
+      Dir.glob(File.join(dir, '*.yml')).sort.map do |file|
+        load_yaml(file)
       end
     end
   end
 
-  # Executor - runs packer commands
-  class Executor
-    def initialize(config)
-      @config = config
+  # Configuration loader for builds
+  class BuildConfig
+    XDG_CONFIG_HOME = ENV.fetch('XDG_CONFIG_HOME', File.expand_path('~/.config'))
+    GLOBAL_CONFIG_DIR = File.join(XDG_CONFIG_HOME, 'pim')
+    GLOBAL_CONFIG_D = File.join(GLOBAL_CONFIG_DIR, 'builds.d')
+
+    def initialize(project_dir: Dir.pwd)
+      @project_dir = project_dir
+      @builds = load_builds
     end
 
-    def packer_init(build_dir)
-      run_packer('init', build_dir)
+    def builds
+      @builds
     end
 
-    def packer_validate(build_dir)
-      run_packer('validate', build_dir)
+    def build(name)
+      @builds[name.to_s]
     end
 
-    def packer_build(build_dir, var_file: nil)
-      args = []
-      args += ['-var-file', var_file] if var_file
-      run_packer('build', build_dir, args)
+    def build_names
+      @builds.keys.sort
+    end
+
+    def matching_builds(pattern)
+      if pattern.include?('*')
+        regex = Regexp.new("^#{pattern.gsub('*', '.*')}$")
+        build_names.select { |name| name.match?(regex) }
+      else
+        build_names.select { |name| name == pattern }
+      end
+    end
+
+    def save_build(name, build_data)
+      FileUtils.mkdir_p(GLOBAL_CONFIG_D)
+      File.write(File.join(GLOBAL_CONFIG_D, "#{name}.yml"), YAML.dump({ name => build_data }))
     end
 
     private
 
-    def run_packer(command, build_dir, extra_args = [])
-      cmd = ['packer', command] + extra_args + ['.']
-      puts "Running: #{cmd.join(' ')}"
-      puts "  in: #{build_dir}"
+    def load_builds
+      builds = {}
 
-      Dir.chdir(build_dir) do
-        system(*cmd)
+      load_builds_d(GLOBAL_CONFIG_D).each do |fragment|
+        builds = DeepMerge.merge(builds, fragment)
+      end
+
+      project_file = File.join(@project_dir, 'builds.yml')
+      builds = DeepMerge.merge(builds, load_yaml(project_file))
+
+      builds
+    end
+
+    def load_yaml(path)
+      return {} unless File.exist?(path)
+      YAML.load_file(path) || {}
+    rescue Psych::SyntaxError => e
+      warn "Warning: Failed to parse #{path}: #{e.message}"
+      {}
+    end
+
+    def load_builds_d(dir)
+      return [] unless Dir.exist?(dir)
+
+      Dir.glob(File.join(dir, '*.yml')).sort.map do |file|
+        load_yaml(file)
       end
     end
   end
 
-  # Core packer management logic
-  class Manager
-    attr_reader :config
+  # Resolves and merges all configuration for a build
+  class BuildResolver
+    XDG_CONFIG_HOME = ENV.fetch('XDG_CONFIG_HOME', File.expand_path('~/.config'))
+    GLOBAL_CONFIG_DIR = File.join(XDG_CONFIG_HOME, 'pim')
 
-    def initialize(config: nil, project_dir: Dir.pwd)
-      @config = config || Config.new(project_dir: project_dir)
-      @renderer = HclRenderer.new(@config)
-      @executor = Executor.new(@config)
+    def initialize(project_dir: Dir.pwd)
+      @project_dir = project_dir
+      @build_config = BuildConfig.new(project_dir: project_dir)
+      @target_config = TargetConfig.new(project_dir: project_dir)
+      @profile_config = PimProfile::Config.new(project_dir: project_dir)
+      @iso_config = PimIso::Config.new(project_dir: project_dir)
     end
 
-    # List available items
-    def list(type)
-      items = case type
-              when 'builds', 'build' then @config.build_names
-              when 'builders', 'builder' then @config.builder_names
-              when 'distros', 'distro' then @config.distro_names
-              when 'provisioners', 'provisioner' then @config.provisioner_names
-              else
-                puts "Unknown type: #{type}"
-                puts "Available types: builds, builders, distros, provisioners"
-                return
-              end
+    attr_reader :build_config, :target_config, :profile_config, :iso_config
 
-      if items.empty?
-        puts "No #{type} configured."
+    def resolve(build_name)
+      build = @build_config.build(build_name)
+      return nil unless build
+
+      iso_key = build['iso']
+      profile_name = build['profile'] || 'default'
+      target_name = build['target']
+      base_image = build['base_image']
+
+      iso_data = iso_key ? @iso_config.isos[iso_key] : nil
+      profile_data = @profile_config.profile(profile_name)
+      target_data = @target_config.target(target_name)
+
+      # Validate required fields based on target type
+      if target_name == 'docker'
+        unless base_image
+          raise "Build '#{build_name}' requires 'base_image' for docker target"
+        end
       else
-        items.each { |name| puts name }
+        unless iso_data
+          raise "Build '#{build_name}' references unknown ISO '#{iso_key}'"
+        end
+      end
+
+      unless target_data && !target_data.empty?
+        raise "Build '#{build_name}' references unknown target '#{target_name}'"
+      end
+
+      # Merge everything
+      resolved = {}
+      resolved = DeepMerge.merge(resolved, iso_data) if iso_data
+      resolved = DeepMerge.merge(resolved, profile_data)
+      resolved = DeepMerge.merge(resolved, target_data)
+      resolved = DeepMerge.merge(resolved, build.fetch('overrides', {}))
+
+      # Add metadata
+      resolved['_build_name'] = build_name
+      resolved['_iso_key'] = iso_key
+      resolved['_profile_name'] = profile_name
+      resolved['_target_name'] = target_name
+      resolved['_base_image'] = base_image
+
+      # Resolve preseed/install template names
+      resolved['_preseed_name'] = build['preseed'] || profile_name
+      resolved['_install_name'] = build['install'] || profile_name
+
+      resolved
+    end
+
+    def compute_image_cache_key(resolved)
+      # Cache key for qcow2 is based on iso + profile + preseed + install content
+      components = []
+
+      # ISO checksum
+      components << resolved['checksum'] if resolved['checksum']
+
+      # Profile content (serialize relevant keys)
+      profile_keys = %w[username password fullname locale keyboard hostname domain
+                        mirror_host mirror_path http_proxy timezone partitioning_method
+                        partitioning_recipe tasksel packages grub_device authorized_keys_url]
+      profile_content = profile_keys.map { |k| "#{k}=#{resolved[k]}" }.join("\n")
+      components << Digest::SHA256.hexdigest(profile_content)
+
+      # Preseed template content
+      preseed_path = find_template('preseeds.d', "#{resolved['_preseed_name']}.cfg.erb")
+      if preseed_path && File.exist?(preseed_path)
+        components << Digest::SHA256.file(preseed_path).hexdigest
+      end
+
+      # Install script content
+      install_path = find_template('installs.d', "#{resolved['_install_name']}.sh")
+      if install_path && File.exist?(install_path)
+        components << Digest::SHA256.file(install_path).hexdigest
+      end
+
+      Digest::SHA256.hexdigest(components.join(':'))[0..15]
+    end
+
+    private
+
+    def find_template(subdir, filename)
+      project_path = File.join(@project_dir, subdir, filename)
+      return project_path if File.exist?(project_path)
+
+      global_path = File.join(GLOBAL_CONFIG_DIR, subdir, filename)
+      return global_path if File.exist?(global_path)
+
+      nil
+    end
+  end
+
+  # Handles rendering of templates
+  class TemplateRenderer
+    XDG_CONFIG_HOME = ENV.fetch('XDG_CONFIG_HOME', File.expand_path('~/.config'))
+    GLOBAL_CONFIG_DIR = File.join(XDG_CONFIG_HOME, 'pim')
+    TEMPLATES_DIR = File.join(GLOBAL_CONFIG_DIR, 'templates')
+
+    def initialize(resolved_config, project_dir: Dir.pwd)
+      @config = resolved_config
+      @project_dir = project_dir
+    end
+
+    def render_preseed(output_path)
+      template_path = find_config_template('preseeds.d', "#{@config['_preseed_name']}.cfg.erb")
+      return nil unless template_path
+
+      content = render_erb(template_path, @config)
+      File.write(output_path, content)
+      output_path
+    end
+
+    def render_install_script(output_path)
+      template_path = find_config_template('installs.d', "#{@config['_install_name']}.sh")
+      return nil unless template_path
+
+      FileUtils.cp(template_path, output_path)
+      output_path
+    end
+
+    def render_pkrvars(output_path, template_name: 'qemu')
+      template_path = find_template("packer/#{template_name}.pkrvars.hcl.erb")
+      return nil unless template_path
+
+      content = render_erb(template_path, @config)
+      File.write(output_path, content)
+      output_path
+    end
+
+    def render_dockerfile(output_path)
+      template_path = find_template("docker/Dockerfile.erb")
+      return nil unless template_path
+
+      content = render_erb(template_path, @config)
+      File.write(output_path, content)
+      output_path
+    end
+
+    def packer_template_path(template_name: 'qemu')
+      find_template("packer/#{template_name}.pkr.hcl")
+    end
+
+    private
+
+    def find_config_template(subdir, filename)
+      project_path = File.join(@project_dir, subdir, filename)
+      return project_path if File.exist?(project_path)
+
+      global_path = File.join(GLOBAL_CONFIG_DIR, subdir, filename)
+      return global_path if File.exist?(global_path)
+
+      nil
+    end
+
+    def find_template(relative_path)
+      project_path = File.join(@project_dir, 'templates', relative_path)
+      return project_path if File.exist?(project_path)
+
+      global_path = File.join(TEMPLATES_DIR, relative_path)
+      return global_path if File.exist?(global_path)
+
+      nil
+    end
+
+    def render_erb(template_path, bindings_hash)
+      template_content = File.read(template_path)
+      
+      # Add generated_at timestamp
+      bindings_hash['_generated_at'] = Time.now.iso8601
+      
+      # Use a custom binding class that returns nil for undefined variables
+      context = RenderContext.new(bindings_hash)
+      
+      template = ERB.new(template_content)
+      template.result(context.get_binding)
+    end
+  end
+
+  # Clean binding context for ERB rendering
+  class RenderContext
+    def initialize(hash)
+      @data = {}
+      hash.each do |key, value|
+        @data[key.to_sym] = value
+        # Define getter method for each key
+        define_singleton_method(key.to_sym) { @data[key.to_sym] }
       end
     end
 
-    # Show merged configuration for a build
-    def show(build_name, distro: nil, builder: nil)
-      build_data = @config.build(build_name)
-      if build_data.empty?
-        puts "Error: Build '#{build_name}' not found"
-        puts "Available builds: #{@config.build_names.join(', ')}"
+    def get_binding
+      binding
+    end
+
+    # Handle undefined variables gracefully
+    def method_missing(name, *args)
+      nil
+    end
+
+    def respond_to_missing?(name, include_private = false)
+      true
+    end
+  end
+
+  # Cache manager for build artifacts
+  class BuildCache
+    XDG_CACHE_HOME = ENV.fetch('XDG_CACHE_HOME', File.expand_path('~/.cache'))
+    CACHE_DIR = File.join(XDG_CACHE_HOME, 'pim', 'builds')
+    IMAGES_DIR = File.join(XDG_CACHE_HOME, 'pim', 'builds', 'images')
+
+    def initialize
+      FileUtils.mkdir_p(CACHE_DIR)
+      FileUtils.mkdir_p(IMAGES_DIR)
+    end
+
+    def build_dir(build_name)
+      path = File.join(CACHE_DIR, build_name)
+      FileUtils.mkdir_p(path)
+      FileUtils.mkdir_p(File.join(path, 'rendered'))
+      Pathname.new(path)
+    end
+
+    def rendered_dir(build_name)
+      build_dir(build_name) / 'rendered'
+    end
+
+    def image_path(cache_key)
+      Pathname.new(File.join(IMAGES_DIR, "#{cache_key}.qcow2"))
+    end
+
+    def image_exists?(cache_key)
+      image_path(cache_key).exist?
+    end
+
+    def manifest_path(build_name)
+      build_dir(build_name) / 'manifest.yml'
+    end
+
+    def load_manifest(build_name)
+      path = manifest_path(build_name)
+      return nil unless path.exist?
+      YAML.load_file(path)
+    rescue Psych::SyntaxError
+      nil
+    end
+
+    def save_manifest(build_name, data)
+      File.write(manifest_path(build_name), YAML.dump(data))
+    end
+
+    def clear(build_name)
+      path = File.join(CACHE_DIR, build_name)
+      FileUtils.rm_rf(path) if Dir.exist?(path)
+    end
+
+    def clear_all
+      FileUtils.rm_rf(CACHE_DIR)
+      FileUtils.mkdir_p(CACHE_DIR)
+      FileUtils.mkdir_p(IMAGES_DIR)
+    end
+  end
+
+  # Builds qcow2 images using Packer
+  class QemuBuilder
+    def initialize(resolved_config, cache: nil, iso_manager: nil)
+      @config = resolved_config
+      @cache = cache || BuildCache.new
+      @iso_manager = iso_manager || PimIso::Manager.new
+    end
+
+    def build(output_path:, dry_run: false)
+      build_name = @config['_build_name']
+      rendered_dir = @cache.rendered_dir(build_name)
+
+      # Ensure ISO is downloaded
+      iso_key = @config['_iso_key']
+      iso_path = @iso_manager.iso_dir / @config['filename']
+
+      unless iso_path.exist?
+        puts "Downloading ISO #{iso_key}..."
+        @iso_manager.download(iso_key)
+      end
+
+      # Render templates
+      renderer = TemplateRenderer.new(@config)
+
+      preseed_path = rendered_dir / 'preseed.cfg'
+      install_path = rendered_dir / 'install.sh'
+      pkrvars_path = rendered_dir / 'variables.pkrvars.hcl'
+
+      renderer.render_preseed(preseed_path)
+      renderer.render_install_script(install_path)
+
+      # Add paths to config for pkrvars rendering
+      @config['_iso_path'] = iso_path.to_s
+      @config['_preseed_path'] = preseed_path.to_s
+      @config['_install_path'] = install_path.to_s
+      @config['_output_path'] = output_path.to_s
+      @config['_http_dir'] = rendered_dir.to_s
+
+      renderer.render_pkrvars(pkrvars_path)
+
+      packer_template = renderer.packer_template_path
+
+      unless packer_template
+        puts "Error: Packer template not found at templates/packer/qemu.pkr.hcl"
         return false
       end
 
-      build = Build.new(build_name, build_data, @config)
+      # Build packer command
+      cmd = [
+        'packer', 'build',
+        '-var-file', pkrvars_path.to_s,
+        packer_template
+      ]
 
-      puts "Build: #{build_name}"
+      if dry_run
+        puts "\n=== DRY RUN ==="
+        puts "\nRendered files:"
+        puts "  preseed.cfg: #{preseed_path}"
+        puts "  install.sh:  #{install_path}"
+        puts "  pkrvars:     #{pkrvars_path}"
+        puts "\nPacker command:"
+        puts "  #{cmd.join(' ')}"
+        puts "\nPreseed content:"
+        puts '-' * 40
+        puts File.read(preseed_path) if preseed_path.exist?
+        puts "\nPkrvars content:"
+        puts '-' * 40
+        puts File.read(pkrvars_path) if pkrvars_path.exist?
+        return true
+      end
+
+      puts "Running: #{cmd.join(' ')}"
+      system(*cmd)
+    end
+  end
+
+  # Builds AMIs directly on AWS using Packer amazon-ebs builder
+  class AwsEbsBuilder
+    def initialize(resolved_config, cache: nil)
+      @config = resolved_config
+      @cache = cache || BuildCache.new
+    end
+
+    def build(dry_run: false)
+      build_name = @config['_build_name']
+      rendered_dir = @cache.rendered_dir(build_name)
+
+      renderer = TemplateRenderer.new(@config)
+      pkrvars_path = rendered_dir / 'variables.pkrvars.hcl'
+
+      renderer.render_pkrvars(pkrvars_path, template_name: 'aws-ebs')
+
+      packer_template = renderer.packer_template_path(template_name: 'aws-ebs')
+
+      unless packer_template
+        puts "Error: Packer template not found at templates/packer/aws-ebs.pkr.hcl"
+        return false
+      end
+
+      cmd = [
+        'packer', 'build',
+        '-var-file', pkrvars_path.to_s,
+        packer_template
+      ]
+
+      if dry_run
+        puts "\n=== DRY RUN ==="
+        puts "\nRendered files:"
+        puts "  pkrvars: #{pkrvars_path}"
+        puts "\nPacker command:"
+        puts "  #{cmd.join(' ')}"
+        puts "\nPkrvars content:"
+        puts '-' * 40
+        puts File.read(pkrvars_path) if pkrvars_path.exist?
+        return true
+      end
+
+      puts "Running: #{cmd.join(' ')}"
+      system(*cmd)
+    end
+  end
+
+  # Builds Docker images
+  class DockerBuilder
+    def initialize(resolved_config, cache: nil)
+      @config = resolved_config
+      @cache = cache || BuildCache.new
+    end
+
+    def build(dry_run: false)
+      build_name = @config['_build_name']
+      rendered_dir = @cache.rendered_dir(build_name)
+
+      renderer = TemplateRenderer.new(@config)
+
+      dockerfile_path = rendered_dir / 'Dockerfile'
+      renderer.render_dockerfile(dockerfile_path)
+
+      # Copy install script if it exists
+      install_path = rendered_dir / 'install.sh'
+      renderer.render_install_script(install_path)
+
+      image_tag = @config['_build_name'].gsub(/[^a-zA-Z0-9_.-]/, '-')
+
+      cmd = [
+        'docker', 'build',
+        '-t', image_tag,
+        '-f', dockerfile_path.to_s,
+        rendered_dir.to_s
+      ]
+
+      if dry_run
+        puts "\n=== DRY RUN ==="
+        puts "\nRendered files:"
+        puts "  Dockerfile:  #{dockerfile_path}"
+        puts "  install.sh:  #{install_path}" if install_path.exist?
+        puts "\nDocker command:"
+        puts "  #{cmd.join(' ')}"
+        puts "\nDockerfile content:"
+        puts '-' * 40
+        puts File.read(dockerfile_path) if dockerfile_path.exist?
+        return true
+      end
+
+      puts "Running: #{cmd.join(' ')}"
+      system(*cmd)
+    end
+  end
+
+  # Uploads qcow2 to Proxmox and creates template
+  class ProxmoxCloneConverter
+    def initialize(qcow2_path, resolved_config)
+      @qcow2_path = qcow2_path
+      @config = resolved_config
+    end
+
+    def convert(dry_run: false)
+      vm_id = @config['proxmox_vmid'] || next_available_vmid
+      vm_name = @config['vm_name'] || @config['_build_name']
+      node = @config['proxmox_node'] || 'pve'
+      storage = @config['proxmox_storage'] || 'local-lvm'
+      memory = @config['memory'] || 2048
+      cores = @config['cores'] || 2
+
+      commands = [
+        "qm create #{vm_id} --name '#{vm_name}' --memory #{memory} --cores #{cores} --net0 virtio,bridge=vmbr0",
+        "qm importdisk #{vm_id} '#{@qcow2_path}' #{storage}",
+        "qm set #{vm_id} --scsihw virtio-scsi-pci --scsi0 #{storage}:vm-#{vm_id}-disk-0",
+        "qm set #{vm_id} --boot c --bootdisk scsi0",
+        "qm set #{vm_id} --ide2 #{storage}:cloudinit",
+        "qm set #{vm_id} --serial0 socket --vga serial0",
+        "qm set #{vm_id} --agent enabled=1",
+        "qm template #{vm_id}"
+      ]
+
+      if dry_run
+        puts "\n=== DRY RUN: Proxmox Clone ==="
+        puts "\nSource qcow2: #{@qcow2_path}"
+        puts "Target VM ID: #{vm_id}"
+        puts "VM Name: #{vm_name}"
+        puts "\nCommands to execute:"
+        commands.each { |cmd| puts "  #{cmd}" }
+        return true
+      end
+
+      commands.each do |cmd|
+        puts "Running: #{cmd}"
+        unless system(cmd)
+          puts "Error: Command failed"
+          return false
+        end
+      end
+
+      puts "\nTemplate created: #{vm_name} (ID: #{vm_id})"
+      true
+    end
+
+    private
+
+    def next_available_vmid
+      # Default starting point, should query Proxmox API in production
+      9000
+    end
+  end
+
+  # Converts qcow2 to AMI and imports to AWS
+  class AwsConverter
+    def initialize(qcow2_path, resolved_config)
+      @qcow2_path = qcow2_path
+      @config = resolved_config
+    end
+
+    def convert(dry_run: false)
+      raw_path = @qcow2_path.to_s.sub(/\.qcow2$/, '.raw')
+      bucket = @config['aws_s3_bucket']
+      region = @config['aws_region'] || 'us-east-1'
+      ami_name = @config['vm_name'] || @config['_build_name']
+
+      unless bucket
+        puts "Error: aws_s3_bucket not configured in target"
+        return false
+      end
+
+      commands = [
+        "qemu-img convert -f qcow2 -O raw '#{@qcow2_path}' '#{raw_path}'",
+        "aws s3 cp '#{raw_path}' 's3://#{bucket}/#{File.basename(raw_path)}'",
+      ]
+
+      # Container file for import-snapshot
+      container_json = {
+        "Description" => ami_name,
+        "Format" => "raw",
+        "UserBucket" => {
+          "S3Bucket" => bucket,
+          "S3Key" => File.basename(raw_path)
+        }
+      }
+
+      if dry_run
+        puts "\n=== DRY RUN: AWS AMI ==="
+        puts "\nSource qcow2: #{@qcow2_path}"
+        puts "Intermediate raw: #{raw_path}"
+        puts "S3 bucket: #{bucket}"
+        puts "Region: #{region}"
+        puts "\nCommands to execute:"
+        commands.each { |cmd| puts "  #{cmd}" }
+        puts "\nThen: aws ec2 import-snapshot with container.json"
+        puts "Then: aws ec2 register-image to create AMI"
+        return true
+      end
+
+      commands.each do |cmd|
+        puts "Running: #{cmd}"
+        unless system(cmd)
+          puts "Error: Command failed"
+          return false
+        end
+      end
+
+      # Import snapshot
+      puts "Importing snapshot to AWS..."
+      container_file = "/tmp/container-#{Process.pid}.json"
+      File.write(container_file, JSON.pretty_generate(container_json))
+
+      import_output = `aws ec2 import-snapshot --region #{region} --disk-container file://#{container_file} 2>&1`
+      puts import_output
+
+      # Note: In production, would poll for completion and register AMI
+      puts "\nSnapshot import initiated. Use 'aws ec2 describe-import-snapshot-tasks' to monitor."
+      true
+    end
+  end
+
+  # Packages qcow2 for UTM
+  class UtmConverter
+    def initialize(qcow2_path, resolved_config)
+      @qcow2_path = qcow2_path
+      @config = resolved_config
+    end
+
+    def convert(dry_run: false)
+      vm_name = @config['vm_name'] || @config['_build_name']
+      output_dir = @config['utm_output_dir'] || File.expand_path('~/Documents/UTM')
+      utm_path = File.join(output_dir, "#{vm_name}.utm")
+
+      if dry_run
+        puts "\n=== DRY RUN: UTM Package ==="
+        puts "\nSource qcow2: #{@qcow2_path}"
+        puts "Output: #{utm_path}"
+        puts "\nWould create UTM bundle with qcow2 disk"
+        return true
+      end
+
+      # UTM bundles are directories with specific structure
+      FileUtils.mkdir_p(utm_path)
+      FileUtils.mkdir_p(File.join(utm_path, 'Data'))
+
+      # Copy qcow2 as the disk image
+      disk_path = File.join(utm_path, 'Data', 'disk-0.qcow2')
+      FileUtils.cp(@qcow2_path, disk_path)
+
+      # Create minimal config.plist
+      # Note: In production, would generate proper UTM config
+      puts "Created UTM bundle at #{utm_path}"
+      puts "Note: You may need to configure VM settings in UTM"
+      true
+    end
+  end
+
+  # Main build orchestrator
+  class Manager
+    def initialize(project_dir: Dir.pwd)
+      @project_dir = project_dir
+      @resolver = BuildResolver.new(project_dir: project_dir)
+      @cache = BuildCache.new
+    end
+
+    attr_reader :resolver, :cache
+
+    def build(build_name, dry_run: false, no_cache: false)
+      resolved = @resolver.resolve(build_name)
+
+      unless resolved
+        puts "Error: Build '#{build_name}' not found"
+        return false
+      end
+
+      target = resolved['_target_name']
+      puts "Building: #{build_name}"
+      puts "  ISO:     #{resolved['_iso_key'] || 'N/A'}"
+      puts "  Profile: #{resolved['_profile_name']}"
+      puts "  Target:  #{target}"
       puts
 
-      # Show distros
-      distros = distro ? [distro] : build.distro_names
-      puts "Distros:"
-      distros.each { |d| puts "  - #{d}" }
-      puts
+      case target
+      when 'docker'
+        build_docker(resolved, dry_run: dry_run)
+      when 'proxmox-iso'
+        build_proxmox_iso(resolved, dry_run: dry_run)
+      when 'aws'
+        # Check if using direct EBS builder or qcow2 import
+        if resolved['builder'] == 'aws-ebs'
+          build_aws_ebs(resolved, dry_run: dry_run)
+        else
+          # qcow2 import path
+          qcow2_path = ensure_qcow2(resolved, dry_run: dry_run, no_cache: no_cache)
+          return false unless qcow2_path
+          AwsConverter.new(qcow2_path, resolved).convert(dry_run: dry_run)
+        end
+      else
+        # qcow2-based targets
+        qcow2_path = ensure_qcow2(resolved, dry_run: dry_run, no_cache: no_cache)
+        return false unless qcow2_path
 
-      # Show builders
-      builders = builder ? [builder] : build.builder_names
-      puts "Builders:"
-      builders.each { |b| puts "  - #{b}" }
-      puts
+        case target
+        when 'qcow2'
+          puts "\nqcow2 image ready: #{qcow2_path}"
+          true
+        when 'proxmox-clone'
+          ProxmoxCloneConverter.new(qcow2_path, resolved).convert(dry_run: dry_run)
+        when 'aws-import'
+          AwsConverter.new(qcow2_path, resolved).convert(dry_run: dry_run)
+        when 'utm'
+          UtmConverter.new(qcow2_path, resolved).convert(dry_run: dry_run)
+        else
+          puts "Error: Unknown target '#{target}'"
+          false
+        end
+      end
+    end
 
-      # Show provisioners
-      unless build.provisioner_names.empty?
-        puts "Provisioners:"
-        build.provisioner_names.each { |p| puts "  - #{p}" }
+    def build_pattern(pattern, dry_run: false, no_cache: false)
+      builds = @resolver.build_config.matching_builds(pattern)
+
+      if builds.empty?
+        puts "No builds matching '#{pattern}'"
+        return false
+      end
+
+      puts "Building #{builds.size} target(s): #{builds.join(', ')}\n\n"
+
+      results = {}
+      builds.each do |build_name|
+        puts "=" * 60
+        results[build_name] = build(build_name, dry_run: dry_run, no_cache: no_cache)
         puts
       end
 
-      # Show merged vars for first distro/builder combination
-      d = distros.first
-      b = builders.first
-      puts "Merged build_vars (#{d} + #{b}):"
-      vars = build.resolve_vars(d, b)
-      vars.sort.each do |key, value|
-        puts "  #{key}: #{value.inspect}"
+      # Summary
+      puts "=" * 60
+      puts "Build Summary:"
+      results.each do |name, success|
+        status = success ? "\e[32mOK\e[0m" : "\e[31mFAILED\e[0m"
+        puts "  #{name}: #{status}"
       end
 
-      true
+      results.values.all?
     end
 
-    # Generate HCL files for a build
-    def generate(build_name, distro: nil, builder: nil, output: nil, vars: {}, dry_run: false)
-      build_data = @config.build(build_name)
-      if build_data.empty?
+    def list_builds
+      @resolver.build_config.build_names
+    end
+
+    def list_targets
+      @resolver.target_config.target_names
+    end
+
+    def show_build(build_name)
+      resolved = @resolver.resolve(build_name)
+
+      unless resolved
         puts "Error: Build '#{build_name}' not found"
         return false
       end
 
-      build = Build.new(build_name, build_data, @config)
+      puts "Build: #{build_name}"
+      puts
+      puts "References:"
+      puts "  ISO:     #{resolved['_iso_key'] || 'N/A'}"
+      puts "  Profile: #{resolved['_profile_name']}"
+      puts "  Target:  #{resolved['_target_name']}"
+      puts
 
-      # Determine distros and builders to process
-      distros = distro ? [distro] : build.distro_names
-      builders = builder ? [builder] : build.builder_names
+      cache_key = @resolver.compute_image_cache_key(resolved)
+      cached = @cache.image_exists?(cache_key)
 
-      if distros.empty?
-        puts "Error: No distros configured for build '#{build_name}'"
-        return false
-      end
+      puts "Cache:"
+      puts "  Key:    #{cache_key}"
+      puts "  Status: #{cached ? 'cached' : 'not built'}"
+      puts "  Path:   #{@cache.image_path(cache_key)}" if cached
+      puts
 
-      if builders.empty?
-        puts "Error: No builders configured for build '#{build_name}'"
-        return false
-      end
-
-      output_base = output || File.join(@config.project_dir, @config.builds_dir, build_name)
-
-      distros.each do |distro_name|
-        distro_obj = Distro.new(distro_name, @config.distro(distro_name))
-
-        builders.each do |builder_name|
-          builder_obj = Builder.new(builder_name, @config.builder(builder_name))
-
-          build_dir = File.join(output_base, distro_obj.slug)
-          puts "Generating: #{build_dir}"
-
-          if dry_run
-            puts "  (dry-run, skipping)"
-            next
-          end
-
-          generate_build(build, distro_obj, builder_obj, build_dir, vars)
-        end
+      puts "Resolved Configuration:"
+      resolved.reject { |k, _| k.start_with?('_') }.each do |key, value|
+        puts "  #{key}: #{value}"
       end
 
       true
     end
 
-    # Generate + validate
-    def validate(build_name, **options)
-      return false unless generate(build_name, **options)
-
-      build_data = @config.build(build_name)
-      build = Build.new(build_name, build_data, @config)
-      output_base = options[:output] || File.join(@config.project_dir, @config.builds_dir, build_name)
-
-      distros = options[:distro] ? [options[:distro]] : build.distro_names
-      builders = options[:builder] ? [options[:builder]] : build.builder_names
-
-      distros.each do |distro_name|
-        distro_obj = Distro.new(distro_name, @config.distro(distro_name))
-        builders.each do |_builder_name|
-          build_dir = File.join(output_base, distro_obj.slug)
-          @executor.packer_validate(build_dir)
-        end
-      end
-    end
-
-    # Generate + init
-    def init(build_name, **options)
-      return false unless generate(build_name, **options)
-
-      build_data = @config.build(build_name)
-      build = Build.new(build_name, build_data, @config)
-      output_base = options[:output] || File.join(@config.project_dir, @config.builds_dir, build_name)
-
-      distros = options[:distro] ? [options[:distro]] : build.distro_names
-      builders = options[:builder] ? [options[:builder]] : build.builder_names
-
-      distros.each do |distro_name|
-        distro_obj = Distro.new(distro_name, @config.distro(distro_name))
-        builders.each do |_builder_name|
-          build_dir = File.join(output_base, distro_obj.slug)
-          @executor.packer_init(build_dir)
-        end
-      end
-    end
-
-    # Generate + build
-    def build(build_name, **options)
-      return false unless generate(build_name, **options)
-
-      build_data = @config.build(build_name)
-      build_obj = Build.new(build_name, build_data, @config)
-      output_base = options[:output] || File.join(@config.project_dir, @config.builds_dir, build_name)
-
-      distros = options[:distro] ? [options[:distro]] : build_obj.distro_names
-      builders = options[:builder] ? [options[:builder]] : build_obj.builder_names
-
-      distros.each do |distro_name|
-        distro_obj = Distro.new(distro_name, @config.distro(distro_name))
-        builders.each do |_builder_name|
-          build_dir = File.join(output_base, distro_obj.slug)
-          var_file = File.join(build_dir, '_build.pkrvars.hcl')
-          @executor.packer_build(build_dir, var_file: var_file)
-        end
-      end
-    end
-
-    # Show packer configuration
-    def show_config
-      puts "Packer Configuration"
-      puts
-      puts "builds_dir: #{@config.builds_dir}"
-      puts "templates_dir: #{Config::GLOBAL_TEMPLATES_DIR}"
-      puts
-      puts "Directories:"
-      puts "  builders.d: #{Config::BUILDERS_D}"
-      puts "  distros.d: #{Config::DISTROS_D}"
-      puts "  builds.d: #{Config::BUILDS_D}"
-      puts "  provisioners.d: #{Config::PROVISIONERS_D}"
-      puts
-      puts "Counts:"
-      puts "  builders: #{@config.builder_names.size}"
-      puts "  distros: #{@config.distro_names.size}"
-      puts "  builds: #{@config.build_names.size}"
-      puts "  provisioners: #{@config.provisioner_names.size}"
-    end
-
     private
 
-    def generate_build(build, distro, builder, build_dir, cli_vars)
-      # Create build directory
-      FileUtils.rm_rf(build_dir)
-      FileUtils.mkdir_p(build_dir)
+    def ensure_qcow2(resolved, dry_run: false, no_cache: false)
+      cache_key = @resolver.compute_image_cache_key(resolved)
+      cached_path = @cache.image_path(cache_key)
+      build_name = resolved['_build_name']
 
-      # Create http directory for preseed
-      http_dir = File.join(build_dir, 'http')
-      FileUtils.mkdir_p(http_dir)
+      if !no_cache && cached_path.exist?
+        puts "Using cached qcow2: #{cached_path}"
+        return cached_path
+      end
 
-      # Resolve merged variables
-      build_vars = build.resolve_vars(distro.name, builder.name, cli_vars)
-      plugins = build.resolve_plugins(builder.name)
+      puts "Building qcow2 image (cache key: #{cache_key})..."
 
-      # Collect HCL content from builder
-      builder_content = collect_hcl_content(:builder, builder)
+      builder = QemuBuilder.new(resolved, cache: @cache)
+      success = builder.build(output_path: cached_path, dry_run: dry_run)
 
-      # Collect HCL content from distro
-      distro_content = collect_hcl_content(:distro, distro)
+      return nil unless success
+      return cached_path if dry_run
 
-      # Combine content
-      variables_content = [builder_content[:variables], distro_content[:variables]].compact.join("\n\n")
-      locals_content = [builder_content[:locals], distro_content[:locals]].compact.join("\n\n")
-      sources_content = [builder_content[:sources], distro_content[:sources]].compact.join("\n\n")
-      provisioners_content = distro_content[:provisioners] || ''
+      # Packer outputs to images/<build_name>/<build_name>
+      # We need to move it to images/<cache_key>.qcow2
+      packer_output_dir = File.join(File.dirname(cached_path.to_s), build_name)
+      packer_output_file = File.join(packer_output_dir, build_name)
 
-      # Write combined HCL files
-      write_if_present(File.join(build_dir, 'variables.pkr.hcl'), variables_content)
-      write_if_present(File.join(build_dir, 'locals.pkr.hcl'), locals_content)
-      write_if_present(File.join(build_dir, 'sources.pkr.hcl'), sources_content)
+      if File.exist?(packer_output_file)
+        FileUtils.mv(packer_output_file, cached_path.to_s)
+        FileUtils.rm_rf(packer_output_dir)
+        puts "Moved qcow2 to cache: #{cached_path}"
+      end
 
-      # Generate build.pkr.hcl from template
-      build_hcl = @renderer.render_build_hcl(
-        build: build,
-        distro: distro,
-        builder: builder,
-        plugins: plugins,
-        sources_content: sources_content,
-        provisioners_content: provisioners_content
-      )
-      if build_hcl
-        File.write(File.join(build_dir, '_build.pkr.hcl'), build_hcl)
+      if cached_path.exist?
+        # Save manifest
+        @cache.save_manifest(build_name, {
+          'cache_key' => cache_key,
+          'image_path' => cached_path.to_s,
+          'built_at' => Time.now.iso8601,
+          'iso' => resolved['_iso_key'],
+          'profile' => resolved['_profile_name']
+        })
+        cached_path
       else
-        # Fallback: generate minimal build.pkr.hcl
-        generate_minimal_build_hcl(build_dir, plugins, builder, provisioners_content)
+        puts "Error: Build completed but qcow2 not found at #{cached_path}"
+        puts "  Checked packer output: #{packer_output_file}"
+        nil
       end
-
-      # Generate pkrvars.hcl from template
-      pkrvars_hcl = @renderer.render_pkrvars_hcl(build_vars)
-      if pkrvars_hcl
-        File.write(File.join(build_dir, '_build.pkrvars.hcl'), pkrvars_hcl)
-      else
-        # Fallback: generate minimal pkrvars
-        generate_minimal_pkrvars(build_dir, build_vars)
-      end
-
-      # Copy preseed template if exists
-      copy_preseed_template(distro, build_dir, http_dir)
-
-      puts "  Generated #{build_dir}"
     end
 
-    def collect_hcl_content(type, obj)
-      content = { variables: nil, locals: nil, sources: nil, provisioners: nil }
-
-      base_dir = case type
-                 when :builder then Config::BUILDERS_D
-                 when :distro then Config::DISTROS_D
-                 end
-
-      # Look for HCL files in the .d subdirectory
-      hcl_dir = File.join(base_dir, obj.name.tr('/', '-'))
-
-      %w[variables locals sources provisioners].each do |file_type|
-        hcl_file = File.join(hcl_dir, "#{file_type}.pkr.hcl")
-        content[file_type.to_sym] = File.read(hcl_file) if File.exist?(hcl_file)
-      end
-
-      content
+    def build_docker(resolved, dry_run: false)
+      DockerBuilder.new(resolved, cache: @cache).build(dry_run: dry_run)
     end
 
-    def write_if_present(path, content)
-      return if content.nil? || content.strip.empty?
-      File.write(path, content)
+    def build_aws_ebs(resolved, dry_run: false)
+      AwsEbsBuilder.new(resolved, cache: @cache).build(dry_run: dry_run)
     end
 
-    def generate_minimal_build_hcl(build_dir, plugins, builder, provisioners_content)
-      content = <<~HCL
-        # Generated by pim packer
-
-        packer {
-          required_plugins {
-      HCL
-
-      plugins.each do |name, config|
-        content += "    #{name} = {\n"
-        config.each do |key, value|
-          content += "      #{key.ljust(7)} = \"#{value}\"\n"
-        end
-        content += "    }\n"
-      end
-
-      content += <<~HCL
-          }
-        }
-
-        build {
-          sources = [
-            "source.#{builder.type}.generic"
-          ]
-
-        #{provisioners_content}
-        }
-      HCL
-
-      File.write(File.join(build_dir, '_build.pkr.hcl'), content)
-    end
-
-    def generate_minimal_pkrvars(build_dir, build_vars)
-      content = "# Generated by pim packer\n\n"
-
-      build_vars.sort.each do |key, value|
-        content += "#{key.ljust(40)} = #{HclRenderer.format_hcl_value(value)}\n"
-      end
-
-      File.write(File.join(build_dir, '_build.pkrvars.hcl'), content)
-    end
-
-    def copy_preseed_template(distro, build_dir, http_dir)
-      template_name = distro.preseed_template
-      return unless template_name
-
-      # Look for preseed template in distro's hcl directory
-      distro_dir = File.join(Config::DISTROS_D, distro.name.tr('/', '-'))
-      template_path = File.join(distro_dir, 'templates', template_name)
-
-      return unless File.exist?(template_path)
-
-      # Copy to http directory with .pkrtpl extension for Packer templatefile()
-      dest_name = template_name.sub(/\.erb$/, '')
-      FileUtils.cp(template_path, File.join(http_dir, dest_name))
-      puts "  Copied preseed template: #{dest_name}"
+    def build_proxmox_iso(resolved, dry_run: false)
+      # Direct Packer build on Proxmox - would use proxmox-iso builder
+      # For now, placeholder
+      puts "proxmox-iso target not yet implemented"
+      puts "Use proxmox-clone to upload a locally-built qcow2"
+      false
     end
   end
 
-  # CLI interface for pim packer
+  # CLI interface
   class CLI < Thor
     def self.exit_on_failure? = true
     remove_command :tree
 
-    desc 'list TYPE', 'List available items (builds, builders, distros, provisioners)'
-    def list(type = 'builds')
-      manager.list(type)
+    desc 'build [PATTERN]', 'Build image(s) matching pattern'
+    option :all, type: :boolean, aliases: '-a', desc: 'Build all defined builds'
+    option :dry_run, type: :boolean, aliases: '-n', desc: 'Show what would be done'
+    option :no_cache, type: :boolean, desc: 'Ignore cached qcow2 images'
+    def build(pattern = nil)
+      if options[:all]
+        manager.build_pattern('*', dry_run: options[:dry_run], no_cache: options[:no_cache])
+      elsif pattern
+        if manager.list_builds.include?(pattern)
+          manager.build(pattern, dry_run: options[:dry_run], no_cache: options[:no_cache])
+        else
+          manager.build_pattern(pattern, dry_run: options[:dry_run], no_cache: options[:no_cache])
+        end
+      else
+        puts "Usage: pim packer build <pattern>"
+        puts "       pim packer build --all"
+        puts
+        puts "Available builds:"
+        manager.list_builds.each { |b| puts "  #{b}" }
+      end
     end
-    map 'ls' => :list
 
-    desc 'show BUILD', 'Show merged configuration for a build'
-    option :distro, type: :string, aliases: '-d', desc: 'Specific distro'
-    option :builder, type: :string, aliases: '-b', desc: 'Specific builder'
+    desc 'list', 'List available builds'
+    option :targets, type: :boolean, aliases: '-t', desc: 'List targets instead of builds'
+    def list
+      if options[:targets]
+        puts "Available targets:"
+        manager.list_targets.each { |t| puts "  #{t}" }
+      else
+        builds = manager.list_builds
+        if builds.empty?
+          puts "No builds defined. Create builds in ~/.config/pim/builds.d/"
+        else
+          puts "Available builds:"
+          builds.each { |b| puts "  #{b}" }
+        end
+      end
+    end
+
+    desc 'show BUILD', 'Show resolved configuration for a build'
     def show(build_name)
-      manager.show(build_name, distro: options[:distro], builder: options[:builder])
+      manager.show_build(build_name)
     end
 
-    desc 'generate BUILD', 'Generate HCL files for a build'
-    option :distro, type: :string, aliases: '-d', desc: 'Specific distro'
-    option :builder, type: :string, aliases: '-b', desc: 'Specific builder'
-    option :output, type: :string, aliases: '-o', desc: 'Output directory'
-    option :var, type: :array, aliases: '-v', default: [], desc: 'Override variables (key=value)'
-    option :dry_run, type: :boolean, aliases: '-n', desc: 'Show what would happen'
-    def generate(build_name)
-      vars = parse_vars(options[:var])
-      manager.generate(
-        build_name,
-        distro: options[:distro],
-        builder: options[:builder],
-        output: options[:output],
-        vars: vars,
-        dry_run: options[:dry_run]
-      )
+    desc 'add', 'Add a new build definition interactively'
+    def add
+      puts "Add New Build\n\n"
+
+      # List available options
+      puts "Available ISOs:"
+      resolver = manager.resolver
+      resolver.iso_config.isos.keys.sort.each { |k| puts "  #{k}" }
+      puts
+
+      print "Build name: "
+      name = $stdin.gets.chomp
+      return puts("Error: Name required") if name.empty?
+
+      print "ISO key: "
+      iso = $stdin.gets.chomp
+
+      puts "\nAvailable profiles:"
+      resolver.profile_config.profile_names.each { |p| puts "  #{p}" }
+      print "Profile [default]: "
+      profile = $stdin.gets.chomp
+      profile = 'default' if profile.empty?
+
+      puts "\nAvailable targets:"
+      resolver.target_config.target_names.each { |t| puts "  #{t}" }
+      print "Target: "
+      target = $stdin.gets.chomp
+      return puts("Error: Target required") if target.empty?
+
+      build_data = {
+        'iso' => iso.empty? ? nil : iso,
+        'profile' => profile,
+        'target' => target
+      }.compact
+
+      puts "\nCreating build: #{name}"
+      build_data.each { |k, v| puts "  #{k}: #{v}" }
+
+      resolver.build_config.save_build(name, build_data)
+      puts "\nOK Build saved to builds.d/#{name}.yml"
     end
 
-    desc 'validate BUILD', 'Generate HCL and run packer validate'
-    option :distro, type: :string, aliases: '-d', desc: 'Specific distro'
-    option :builder, type: :string, aliases: '-b', desc: 'Specific builder'
-    option :output, type: :string, aliases: '-o', desc: 'Output directory'
-    option :var, type: :array, aliases: '-v', default: [], desc: 'Override variables (key=value)'
-    def validate(build_name)
-      vars = parse_vars(options[:var])
-      manager.validate(
-        build_name,
-        distro: options[:distro],
-        builder: options[:builder],
-        output: options[:output],
-        vars: vars
-      )
-    end
+    desc 'cache', 'Manage build cache'
+    option :clear, type: :string, desc: 'Clear cache for specific build'
+    option :clear_all, type: :boolean, desc: 'Clear entire cache'
+    def cache
+      if options[:clear_all]
+        print "Clear entire build cache? (y/N) "
+        return unless $stdin.gets.chomp.downcase == 'y'
+        manager.cache.clear_all
+        puts "Cache cleared"
+      elsif options[:clear]
+        manager.cache.clear(options[:clear])
+        puts "Cleared cache for #{options[:clear]}"
+      else
+        puts "Cache directory: #{BuildCache::CACHE_DIR}"
+        puts "Images directory: #{BuildCache::IMAGES_DIR}"
 
-    desc 'init BUILD', 'Generate HCL and run packer init'
-    option :distro, type: :string, aliases: '-d', desc: 'Specific distro'
-    option :builder, type: :string, aliases: '-b', desc: 'Specific builder'
-    option :output, type: :string, aliases: '-o', desc: 'Output directory'
-    option :var, type: :array, aliases: '-v', default: [], desc: 'Override variables (key=value)'
-    def init(build_name)
-      vars = parse_vars(options[:var])
-      manager.init(
-        build_name,
-        distro: options[:distro],
-        builder: options[:builder],
-        output: options[:output],
-        vars: vars
-      )
-    end
-
-    desc 'build BUILD', 'Generate HCL and run packer build'
-    option :distro, type: :string, aliases: '-d', desc: 'Specific distro'
-    option :builder, type: :string, aliases: '-b', desc: 'Specific builder'
-    option :output, type: :string, aliases: '-o', desc: 'Output directory'
-    option :var, type: :array, aliases: '-v', default: [], desc: 'Override variables (key=value)'
-    def build(build_name)
-      vars = parse_vars(options[:var])
-      manager.build(
-        build_name,
-        distro: options[:distro],
-        builder: options[:builder],
-        output: options[:output],
-        vars: vars
-      )
-    end
-
-    desc 'config', 'Show packer configuration'
-    def config
-      manager.show_config
+        if Dir.exist?(BuildCache::IMAGES_DIR)
+          images = Dir.glob(File.join(BuildCache::IMAGES_DIR, '*.qcow2'))
+          if images.any?
+            puts "\nCached images:"
+            images.each do |img|
+              size = File.size(img)
+              puts "  #{File.basename(img)} (#{format_bytes(size)})"
+            end
+          else
+            puts "\nNo cached images"
+          end
+        end
+      end
     end
 
     private
@@ -923,13 +1087,14 @@ module PimPacker
       @manager ||= Manager.new
     end
 
-    def parse_vars(var_array)
-      vars = {}
-      var_array.each do |v|
-        key, value = v.split('=', 2)
-        vars[key] = value if key && value
-      end
-      vars
+    def format_bytes(bytes)
+      units = ['B', 'KB', 'MB', 'GB', 'TB']
+      return '0 B' if bytes == 0
+
+      exp = (Math.log(bytes) / Math.log(1024)).floor
+      exp = [exp, units.size - 1].min
+
+      format('%.2f %s', bytes.to_f / (1024**exp), units[exp])
     end
   end
 end

@@ -1,0 +1,16 @@
+# PIM Docker Target
+# Build container image (does not use ISO)
+
+docker:
+  builder: docker
+
+  # Default base image (override in build definition)
+  # base_image: debian:12-slim
+
+  # Build settings
+  docker_no_cache: false
+  docker_pull: true
+
+  # Output
+  # docker_registry: ""
+  # docker_push: false

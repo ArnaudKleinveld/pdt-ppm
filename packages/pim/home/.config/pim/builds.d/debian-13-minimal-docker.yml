@@ -1,0 +1,5 @@
+# Example build: Debian 13 Docker image
+debian-13-minimal-docker:
+  base_image: debian:13-slim
+  profile: default
+  target: docker
