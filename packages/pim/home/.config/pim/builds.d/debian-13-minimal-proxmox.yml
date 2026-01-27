@@ -1,8 +1,0 @@
-# Example build: Debian 13 minimal for Proxmox (clone method)
-debian-13-minimal-proxmox:
-  iso: debian-13.3.0-amd64-netinst
-  profile: default
-  target: proxmox-clone
-  overrides:
-    proxmox_vmid: 9001
-    vm_name: debian-13-minimal-template

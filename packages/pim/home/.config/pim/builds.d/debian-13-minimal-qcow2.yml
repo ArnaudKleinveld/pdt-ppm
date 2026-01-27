@@ -1,5 +1,0 @@
-# Example build: Debian 13 minimal qcow2 image
-debian-13-minimal-qcow2:
-  iso: debian-13.3.0-amd64-netinst
-  profile: default
-  target: qcow2

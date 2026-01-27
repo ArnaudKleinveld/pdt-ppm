@@ -13,7 +13,6 @@ require 'fileutils'
 require 'pim/iso'
 require 'pim/profile'
 require 'pim/ventoy'
-require 'pim/packer'
 
 module Pim
   # Deep merge utility for configuration hashes
@@ -317,9 +316,6 @@ module Pim
 
     desc 'ventoy SUBCOMMAND', 'Ventoy USB boot management'
     subcommand 'ventoy', PimVentoy::CLI
-
-    desc 'packer SUBCOMMAND', 'Packer template management'
-    subcommand 'packer', PimPacker::CLI
   end
 end
 

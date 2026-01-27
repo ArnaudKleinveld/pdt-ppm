@@ -1,21 +1,21 @@
 # pim - Product Image Manager
 
-dependencies() {
-  echo "ruby"
-  # echo "ruby packer podman utm"
-}
+# dependencies() {
+#   echo "ruby"
+#   # echo "ruby podman utm"
+# }
 
 install_linux() {
   install_dep xz-utils fdisk parted dosfstools expect exfat-fuse exfat-utils
 }
 
 install_macos() {
-  install_dep qemu
+  install_dep qemu tiger-vnc
 }
 
 post_install() {
   source <(mise activate bash)
-  gem install webrick thor
+  install_gem webrick thor
 
   # Download and extract Ventoy (config from pim.yml)
   local config_file="$XDG_CONFIG_HOME/pim/pim.yml"
