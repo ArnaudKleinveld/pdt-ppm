@@ -1,17 +1,22 @@
 # utm
 
-alias utm-ls='utmctl list'
-alias utm-start='utmctl start'
-alias utm-stop='utmctl stop'
-alias utm-status='utmctl status'
-alias utm-clone='utmctl clone'
-alias utm-delete='utmctl delete'
+# utm wrapper function
+utm() {
+    local cmd="$1"
+    shift
 
-# Get IPv4 address of UTM VM (no newline)
-utm-ip() { utmctl ip-address "$1" | grep -v ':' | tr -d '\n' }
-
-# SSH into UTM VM by name
-utm-ssh() { ssh "$(utm-ip "$1")" }
+    case "$cmd" in
+        ls)     utmctl list "$@" ;;
+        start)  utmctl start "$@" ;;
+        stop)   utmctl stop "$@" ;;
+        status) utmctl status "$@" ;;
+        clone)  utmctl clone "$@" ;;
+        delete) utmctl delete "$@" ;;
+        ip)     utmctl ip-address "$1" | grep -v ':' | tr -d '\n' ;;
+        ssh)    ssh "$(utm ip "$1")" ;;
+        *)      echo "Usage: utm {ls|start|stop|status|clone|delete|ip|ssh} [args]" >&2; return 1 ;;
+    esac
+}
 
 # Quick VM operations
 alias utmdev='utmctl start "Development VM" && sleep 10 && utmctl ip-address "Development VM"'
