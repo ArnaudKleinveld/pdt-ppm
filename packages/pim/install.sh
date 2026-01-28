@@ -15,14 +15,14 @@ install_macos() {
 
 post_install() {
   source <(mise activate bash)
-  install_gem webrick thor
+  install_gem webrick thor net-ssh net-scp
+}
+
+xyzlm() {
 
   # Download and extract Ventoy (config from pim.yml)
   local config_file="$XDG_CONFIG_HOME/pim/pim.yml"
   local cache_dir="$XDG_CACHE_HOME/pim/ventoy"
-}
-
-xyzlm() {
 
   # Parse ventoy config from YAML using Ruby (already installed as dependency)
   local ventoy_version ventoy_dir ventoy_file ventoy_checksum

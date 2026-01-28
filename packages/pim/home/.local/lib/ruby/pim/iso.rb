@@ -126,6 +126,28 @@ module PimIso
       @config_obj.iso_dir
     end
 
+    # Find an ISO by architecture
+    # Returns [key, data] or nil if not found
+    def find_by_arch(arch)
+      normalized = normalize_arch(arch)
+
+      isos.each do |key, data|
+        iso_arch = normalize_arch(data['architecture'])
+        return [key, data] if iso_arch == normalized
+      end
+
+      nil
+    end
+
+    # Get ISO path for a given key
+    def iso_path(key)
+      iso = isos[key]
+      return nil unless iso
+
+      filename = iso['filename'] || "#{key}.iso"
+      iso_dir / filename
+    end
+
     def list(long: false)
       if isos.empty?
         puts 'No ISOs in catalog. Use "pim-iso add" to add some.'
@@ -354,6 +376,16 @@ module PimIso
 
     def file_exists?(filename)
       (iso_dir / filename).exist?
+    end
+
+    def normalize_arch(arch)
+      return nil unless arch
+
+      case arch.to_s.downcase
+      when 'arm64', 'aarch64' then 'arm64'
+      when 'x86_64', 'amd64' then 'x86_64'
+      else arch.to_s.downcase
+      end
     end
 
     def derive_attributes(url, checksum_input)
