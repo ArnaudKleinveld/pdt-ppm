@@ -1,0 +1,367 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'dry/cli'
+require 'yaml'
+require 'fileutils'
+
+# Add lib path
+$LOAD_PATH.unshift(File.expand_path('~/.local/lib/ruby'))
+
+require 'skills/config'
+require 'skills/id'
+require 'skills/registry'
+require 'skills/cache'
+require 'skills/state'
+require 'skills/search'
+require 'skills/installer'
+require 'skills/ui'
+
+module Skills
+  VERSION = '0.1.0'
+
+  module CLI
+    module Commands
+      extend Dry::CLI::Registry
+
+      class Version < Dry::CLI::Command
+        desc 'Show version'
+
+        def call(*)
+          puts "skills #{VERSION}"
+        end
+      end
+
+      class Find < Dry::CLI::Command
+        desc 'Search for skills via Claude'
+
+        argument :query, required: true, desc: 'Search query'
+        option :max, type: :integer, default: 10, desc: 'Maximum results'
+        option :interactive, type: :boolean, default: true, aliases: ['-i'], desc: 'Interactive mode'
+
+        def call(query:, **options)
+          config = Config.new
+          ui = UI.new(config: config)
+          cache = Cache.new(config: config)
+
+          ui.info "Searching for: #{query}..."
+
+          search = Search.new(config: config)
+          results = search.find(query, max_results: options[:max])
+
+          if results.empty?
+            ui.warn 'No results found.'
+            return
+          end
+
+          cache.store(query: query, provider: config.search_provider, results: results)
+          ui.success "Found #{results.size} result(s), cached."
+          puts
+
+          ui.skills_table(results, source_label: 'cache')
+
+          return unless options[:interactive] && config.interactive?
+
+          puts
+          handle_interactive(config, ui, cache, results)
+        end
+
+        private
+
+        def handle_interactive(config, ui, cache, results)
+          loop do
+            id = ui.select_skill(results, prompt_text: 'Select a skill (or Ctrl-C to exit):')
+            break unless id
+
+            skill = results[id]
+            action = ui.select_action(skill)
+
+            case action
+            when :install
+              installer = Installer.new(config: config, state: State.new(config: config))
+              installer.install(skill, source: 'cache')
+              ui.success "Installed: #{skill['name']}"
+            when :show
+              puts
+              ui.skill_detail(skill)
+              puts
+            when :add
+              registry = Registry.new(config: config)
+              registry.add(skill)
+              ui.success "Added to registry: #{skill['name']}"
+            when :cancel
+              break
+            end
+          end
+        rescue TTY::Reader::InputInterrupt
+          puts
+        end
+      end
+
+      class List < Dry::CLI::Command
+        desc 'List skills'
+
+        argument :pattern, required: false, desc: 'Filter pattern'
+        option :cache, type: :boolean, default: false, desc: 'Include cache results'
+        option :all, type: :boolean, default: false, aliases: ['-a'], desc: 'Show both registry and cache'
+
+        def call(pattern: nil, **options)
+          config = Config.new
+          ui = UI.new(config: config)
+          registry = Registry.new(config: config)
+
+          registry_skills = registry.search(pattern)
+
+          unless registry_skills.empty?
+            puts 'Registry:'
+            ui.skills_table(registry_skills, source_label: 'registry')
+          end
+
+          if options[:cache] || options[:all]
+            cache = Cache.new(config: config)
+            cache_skills = cache.search(pattern)
+
+            unless cache_skills.empty?
+              puts
+              puts "Cache (query: #{cache.query}):"
+              ui.skills_table(cache_skills, source_label: 'cache')
+            end
+          end
+
+          if registry_skills.empty? && (!options[:cache] && !options[:all])
+            puts 'Registry is empty. Use "skills find <query>" to discover skills.'
+          end
+        end
+      end
+
+      class Show < Dry::CLI::Command
+        desc 'Show skill details'
+
+        argument :id, required: true, desc: 'Skill ID'
+
+        def call(id:, **)
+          config = Config.new
+          ui = UI.new(config: config)
+
+          registry = Registry.new(config: config)
+          skill = registry.find(id)
+
+          unless skill
+            cache = Cache.new(config: config)
+            skill = cache.find(id)
+          end
+
+          unless skill
+            ui.error "Skill not found: #{id}"
+            return
+          end
+
+          ui.skill_detail(skill)
+        end
+      end
+
+      class Install < Dry::CLI::Command
+        desc 'Install a skill'
+
+        argument :id, required: true, desc: 'Skill ID'
+        option :yes, type: :boolean, default: false, aliases: ['-y'], desc: 'Skip confirmation'
+
+        def call(id:, **options)
+          config = Config.new
+          ui = UI.new(config: config)
+          state = State.new(config: config)
+
+          if state.installed?(id)
+            ui.warn "Skill already installed: #{id}"
+            return
+          end
+
+          registry = Registry.new(config: config)
+          skill = registry.find(id)
+          source = 'registry'
+
+          unless skill
+            cache = Cache.new(config: config)
+            skill = cache.find(id)
+            source = 'cache'
+          end
+
+          unless skill
+            ui.error "Skill not found: #{id}"
+            ui.info 'Use "skills find <query>" to search for skills.'
+            return
+          end
+
+          ui.skill_detail(skill)
+          puts
+
+          if source == 'cache' && !options[:yes]
+            unless ui.confirm('This skill is from cache (not validated). Install anyway?')
+              puts 'Cancelled.'
+              return
+            end
+          end
+
+          installer = Installer.new(config: config, state: state)
+          installer.install(skill, source: source)
+          ui.success "Installed: #{skill['name']}"
+        rescue StandardError => e
+          ui.error "Install failed: #{e.message}"
+        end
+      end
+
+      class Uninstall < Dry::CLI::Command
+        desc 'Uninstall a skill'
+
+        argument :id, required: true, desc: 'Skill ID'
+        option :yes, type: :boolean, default: false, aliases: ['-y'], desc: 'Skip confirmation'
+
+        def call(id:, **options)
+          config = Config.new
+          ui = UI.new(config: config)
+          state = State.new(config: config)
+
+          unless state.installed?(id)
+            ui.error "Skill not installed: #{id}"
+            return
+          end
+
+          registry = Registry.new(config: config)
+          skill = registry.find(id)
+
+          unless skill
+            cache = Cache.new(config: config)
+            skill = cache.find(id)
+          end
+
+          skill ||= { 'id' => id, 'name' => id }
+
+          unless options[:yes]
+            unless ui.confirm("Uninstall #{skill['name']}?")
+              puts 'Cancelled.'
+              return
+            end
+          end
+
+          installer = Installer.new(config: config, state: state)
+          installer.uninstall(skill)
+          ui.success "Uninstalled: #{skill['name']}"
+        rescue StandardError => e
+          ui.error "Uninstall failed: #{e.message}"
+        end
+      end
+
+      class Add < Dry::CLI::Command
+        desc 'Add skill from cache to registry'
+
+        argument :id, required: true, desc: 'Skill ID'
+
+        def call(id:, **)
+          config = Config.new
+          ui = UI.new(config: config)
+          cache = Cache.new(config: config)
+          registry = Registry.new(config: config)
+
+          skill = cache.find(id)
+
+          unless skill
+            ui.error "Skill not found in cache: #{id}"
+            ui.info 'Use "skills find <query>" to search for skills first.'
+            return
+          end
+
+          if registry.exists?(id)
+            ui.warn "Skill already in registry: #{id}"
+            return
+          end
+
+          skill_to_add = skill.merge(
+            'added_at' => Time.now.utc.iso8601,
+            'added_by' => ENV['USER']
+          )
+
+          registry.add(skill_to_add)
+          ui.success "Added to registry: #{skill['name']}"
+          ui.info 'Run "ppm update" to share with team.'
+        end
+      end
+
+      class Remove < Dry::CLI::Command
+        desc 'Remove skill from registry'
+
+        argument :id, required: true, desc: 'Skill ID'
+        option :force, type: :boolean, default: false, aliases: ['-f'], desc: 'Skip confirmation'
+
+        def call(id:, **options)
+          config = Config.new
+          ui = UI.new(config: config)
+          registry = Registry.new(config: config)
+
+          skill = registry.find(id)
+
+          unless skill
+            ui.error "Skill not found in registry: #{id}"
+            return
+          end
+
+          unless options[:force]
+            ui.warn 'Warning: This will remove the skill from the shared registry.'
+            unless ui.confirm("Remove #{skill['name']} from registry?")
+              puts 'Cancelled.'
+              return
+            end
+          end
+
+          registry.remove(id)
+          ui.success "Removed from registry: #{skill['name']}"
+        end
+      end
+
+      class StateCmd < Dry::CLI::Command
+        desc 'Show installed skills'
+
+        def call(*)
+          config = Config.new
+          ui = UI.new(config: config)
+          state = State.new(config: config)
+
+          installed = state.installed
+
+          if installed.empty?
+            puts 'No skills installed.'
+            return
+          end
+
+          puts "Installed skills (#{installed.size}):"
+          ui.state_table(installed)
+        end
+      end
+
+      class CacheClear < Dry::CLI::Command
+        desc 'Clear search cache'
+
+        def call(*)
+          config = Config.new
+          ui = UI.new(config: config)
+          cache = Cache.new(config: config)
+
+          cache.clear
+          ui.success 'Cache cleared.'
+        end
+      end
+
+      register 'version', Version
+      register 'find', Find
+      register 'list', List
+      register 'show', Show
+      register 'install', Install
+      register 'uninstall', Uninstall
+      register 'add', Add
+      register 'remove', Remove
+      register 'state', StateCmd
+      register 'cache clear', CacheClear
+    end
+  end
+end
+
+Dry::CLI.new(Skills::CLI::Commands).call

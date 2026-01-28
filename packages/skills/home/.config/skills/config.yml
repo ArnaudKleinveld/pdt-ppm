@@ -1,0 +1,9 @@
+# Skills configuration
+---
+search:
+  provider: claude_code    # claude_code | api
+  max_results: 10
+
+ui:
+  interactive: true
+  colors: true

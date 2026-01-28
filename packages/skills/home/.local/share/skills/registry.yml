@@ -1,0 +1,5 @@
+# Skills registry - shared catalog of validated skills
+# This file is version controlled via pdt-ppm
+# Add skills using: skills add <id>
+---
+skills: {}
