@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 require 'fileutils'
+require 'open3'
 require 'time'
+require 'tmpdir'
 
 module PimBuild
   # Local builder - builds images on the current machine
@@ -20,9 +22,12 @@ module PimBuild
       @server_thread = nil
     end
 
-    def build(cache_key:, scripts: [], output_callback: nil)
+    def build(cache_key:, scripts: [], output_callback: nil, vnc: nil, console: false, console_log: nil)
       @output = output_callback || method(:default_output)
       @scripts = scripts
+      @vnc = vnc
+      @console = console
+      @console_log = console_log
 
       begin
         output(:info, "Starting build for #{@profile_name}-#{@arch}")
@@ -36,26 +41,47 @@ module PimBuild
         # 3. Start preseed server in background
         start_preseed_server
 
-        # 4. Start QEMU with ISO boot
-        start_vm(image_path)
+        # 4. Extract kernel/initrd for direct boot (bypasses GRUB)
+        extract_installer_kernel
 
-        # 5. Wait for installation to complete and SSH to become available
+        # 5. Set up EFI pflash (shared between install and boot phases)
+        setup_efi_pflash if @arch == 'arm64'
+
+        # === Phase 1: Installation ===
+        # 5. Start QEMU with installer kernel + preseed (halts when done)
+        run_installer(image_path)
+
+        # 6. Wait for installer to finish (VM powers off)
+        wait_for_install
+
+        # === Phase 2: Boot from disk ===
+        # 7. Start QEMU from installed disk
+        boot_vm(image_path)
+
+        # 8. Wait for SSH
         wait_for_ssh
 
-        # 6. Run provisioning scripts
+        # 9. Run provisioning scripts
         run_scripts
 
-        # 7. Finalize image
+        # 10. Finalize image
         finalize_image
 
-        # 8. Shutdown VM
+        # 11. Shutdown VM
         shutdown_vm
 
-        # 9. Register in registry
+        # 12. Save EFI vars alongside image (for booting later)
+        save_efi_vars(image_path) if @arch == 'arm64'
+
+        # 13. Register in registry
         register_image(image_path, cache_key)
 
         output(:success, "Build complete: #{image_path}")
         image_path
+      rescue Interrupt
+        output(:info, "\nBuild interrupted")
+        cleanup
+        exit 130
       rescue StandardError => e
         output(:error, "Build failed: #{e.message}")
         cleanup
@@ -77,6 +103,7 @@ module PimBuild
                when :success then 'OK '
                when :error then 'FAIL '
                when :progress then '... '
+               when :console then '[console] '
                else '  '
                end
       puts "#{prefix}#{message}"
@@ -97,7 +124,6 @@ module PimBuild
     end
 
     def disk_size
-      # Profile can override global disk size
       @profile.data.dig('build', 'disk_size') || @config.disk_size
     end
 
@@ -112,10 +138,8 @@ module PimBuild
     def start_preseed_server
       output(:info, 'Starting preseed server')
 
-      # Find available port for preseed server
       @preseed_port = PimQemu.find_available_port(start_port: 8080)
 
-      # Create server instance using existing Pim::Server
       @server = Pim::Server.new(
         profile: @profile,
         port: @preseed_port,
@@ -124,22 +148,29 @@ module PimBuild
         install_name: @profile_name
       )
 
-      # Start in background thread
+      # Suppress server output during startup, then restore before spawning QEMU
+      # NOTE: $stdout.reopen is process-wide — must restore before spawn or
+      # child processes inherit /dev/null as their stdout
+      saved_stdout = $stdout.dup
+      $stdout.reopen('/dev/null', 'w')
+
       @server_thread = Thread.new do
-        # Suppress output from server
-        original_stdout = $stdout.dup
-        $stdout.reopen('/dev/null', 'w')
         begin
           @server.start
         rescue StandardError
           # Server stopped
-        ensure
-          $stdout.reopen(original_stdout)
         end
       end
 
-      # Give server time to start
+      # Give server time to start (WEBrick installs its own SIGINT handler)
       sleep 1
+
+      # Restore stdout before any child processes are spawned
+      $stdout.reopen(saved_stdout)
+      saved_stdout.close
+
+      # Restore SIGINT so Ctrl-C interrupts the build, not just WEBrick
+      trap('INT') { Thread.main.raise(Interrupt) }
 
       output(:info, "Preseed server running on port #{@preseed_port}")
     end
@@ -155,48 +186,228 @@ module PimBuild
             &.ip_address || '127.0.0.1'
     end
 
-    def start_vm(image_path)
-      output(:info, 'Starting QEMU VM')
+    def extract_installer_kernel
+      output(:info, 'Extracting kernel and initrd from ISO')
+
+      @kernel_dir = Dir.mktmpdir('pim-kernel-')
+
+      install_subdir = case @arch
+                       when 'arm64' then 'install.a64'
+                       when 'x86_64' then 'install.amd'
+                       else raise BuildError, "Unsupported architecture: #{@arch}"
+                       end
+
+      vmlinuz = "#{install_subdir}/vmlinuz"
+      initrd = "#{install_subdir}/initrd.gz"
+
+      _, stderr, status = Open3.capture3(
+        'bsdtar', 'xf', @iso_path, '-C', @kernel_dir, vmlinuz, initrd
+      )
+
+      unless status.success?
+        FileUtils.rm_rf(@kernel_dir)
+        raise BuildError, "Failed to extract kernel from ISO: #{stderr}"
+      end
+
+      @kernel_path = File.join(@kernel_dir, vmlinuz)
+      @initrd_path = File.join(@kernel_dir, initrd)
+
+      unless File.exist?(@kernel_path) && File.exist?(@initrd_path)
+        FileUtils.rm_rf(@kernel_dir)
+        raise BuildError, 'Kernel or initrd not found in ISO'
+      end
+
+      output(:info, "Extracted #{vmlinuz} and #{initrd}")
+    end
+
+    def setup_efi_pflash
+      @efi_code_path = find_efi_firmware
+      raise BuildError, 'EFI firmware (code) not found' unless @efi_code_path
+
+      vars_template = find_efi_vars_template
+      @efi_vars_path = File.join(@kernel_dir, 'efivars.fd')
+
+      if vars_template
+        FileUtils.cp(vars_template, @efi_vars_path)
+      else
+        # Create empty 64MB vars file
+        File.open(@efi_vars_path, 'wb') { |f| f.write("\0" * (64 * 1024 * 1024)) }
+      end
+
+      output(:info, 'EFI pflash configured')
+    end
+
+    def add_efi_pflash(builder)
+      builder.extra_args(
+        '-drive', "if=pflash,format=raw,file=#{@efi_code_path},readonly=on",
+        '-drive', "if=pflash,format=raw,file=#{@efi_vars_path}"
+      )
+    end
+
+    def find_efi_vars_template
+      paths = [
+        '/opt/homebrew/share/qemu/edk2-arm-vars.fd',
+        '/usr/local/share/qemu/edk2-arm-vars.fd',
+        '/usr/share/qemu/edk2-arm-vars.fd',
+        '/usr/share/AAVMF/AAVMF_VARS.fd'
+      ]
+      paths.find { |p| File.exist?(p) }
+    end
+
+    # --- Phase 1: Run the installer with direct kernel boot ---
+
+    def run_installer(image_path)
+      output(:info, 'Starting installer VM')
+
+      serial_console = @arch == 'arm64' ? 'ttyAMA0' : 'ttyS0'
+      use_display = !@vnc.nil?
+      serial = if @console_log
+                 "file:#{@console_log}"
+               elsif @console
+                 'stdio'
+               elsif use_display
+                 'null'
+               else
+                 nil
+               end
 
       builder = PimQemu::CommandBuilder.new(
         arch: @arch,
         memory: memory,
         cpus: cpus,
-        display: false
+        display: use_display,
+        serial: serial
       )
 
       builder.add_drive(image_path, format: 'qcow2')
       builder.set_cdrom(@iso_path)
       builder.add_user_net(host_port: @ssh_port, guest_port: 22)
 
-      # Add boot parameters for automated install
-      # For Debian preseed, we need to pass boot parameters via kernel args
-      # This requires extracting kernel from ISO which is complex
-      # For now, user must manually configure boot in preseed or use autoinstall
+      # EFI firmware via pflash (so installer detects EFI and installs EFI GRUB)
+      add_efi_pflash(builder) if @arch == 'arm64'
 
-      # Add EFI firmware for ARM64
-      if @arch == 'arm64'
-        efi_firmware = find_efi_firmware
-        if efi_firmware
-          builder.extra_args('-bios', efi_firmware)
-        else
-          output(:info, 'Warning: No EFI firmware found, VM may not boot')
+      # Direct kernel boot with preseed
+      consoles = []
+      consoles << "console=#{serial_console},115200n8" if !@vnc || @console || @console_log
+      consoles << 'console=tty0' if @vnc
+      append_parts = [
+        'auto=true', 'priority=critical',
+        "preseed/url=#{preseed_url}",
+        'grub-installer/force-efi-extra-removable=true',
+        *consoles,
+        '---'
+      ]
+      builder.extra_args('-kernel', @kernel_path, '-initrd', @initrd_path,
+                         '-append', append_parts.join(' '))
+
+      # QEMU exits when guest reboots (instead of restarting the installer)
+      builder.extra_args('-no-reboot')
+
+      # VNC display + virtual GPU/keyboard for ARM64
+      if @vnc
+        builder.extra_args('-vnc', ":#{@vnc}")
+        if @arch == 'arm64'
+          builder.extra_args('-device', 'virtio-gpu-pci,xres=1024,yres=768')
+          builder.extra_args('-device', 'usb-ehci')
+          builder.extra_args('-device', 'usb-kbd')
+          builder.extra_args('-device', 'usb-tablet')
         end
       end
 
       @vm = PimQemu::VM.new(command: builder.build, ssh_port: @ssh_port)
-      @vm.start_background
+
+      if @console && !@console_log
+        @vm.start_console(detach: false)
+      else
+        @vm.start_background(detach: false)
+      end
+
+      output(:info, "Installer started (PID: #{@vm.pid})")
+      output(:info, "Preseed URL: #{preseed_url}")
+
+      if @vnc
+        output(:info, "VNC available on localhost:#{5900 + @vnc}")
+      end
+
+      if @console_log
+        output(:info, "Console log: #{@console_log}")
+        output(:info, "Tail with: tail -f #{@console_log}")
+      end
+    end
+
+    def wait_for_install
+      output(:info, 'Waiting for installation to complete (VM will power off)...')
+
+      result = @vm.wait_for_exit(timeout: @config.ssh_timeout, poll_interval: 30) do |remaining|
+        output(:progress, "Installing... #{remaining}s remaining")
+      end
+
+      if result.nil?
+        raise BuildError, 'Installation timed out'
+      end
+
+      output(:success, 'Installation complete — VM powered off')
+      @vm = nil
+    end
+
+    # --- Phase 2: Boot the installed system from disk ---
+
+    def boot_vm(image_path)
+      output(:info, 'Booting installed system from disk')
+
+      serial_console = @arch == 'arm64' ? 'ttyAMA0' : 'ttyS0'
+      use_display = !@vnc.nil?
+      serial = if @console_log
+                 "file:#{@console_log}"
+               elsif @console
+                 'stdio'
+               elsif use_display
+                 'null'
+               else
+                 nil
+               end
+
+      builder = PimQemu::CommandBuilder.new(
+        arch: @arch,
+        memory: memory,
+        cpus: cpus,
+        display: use_display,
+        serial: serial
+      )
+
+      builder.add_drive(image_path, format: 'qcow2')
+      builder.add_user_net(host_port: @ssh_port, guest_port: 22)
+
+      # No -kernel, -initrd, -cdrom — boot from installed disk via EFI GRUB
+      # Uses same pflash vars from phase 1 (has boot entries from installer)
+      if @arch == 'arm64'
+        add_efi_pflash(builder)
+      end
+
+      # VNC display
+      if @vnc
+        builder.extra_args('-vnc', ":#{@vnc}")
+        if @arch == 'arm64'
+          builder.extra_args('-device', 'virtio-gpu-pci,xres=1024,yres=768')
+          builder.extra_args('-device', 'usb-ehci')
+          builder.extra_args('-device', 'usb-kbd')
+          builder.extra_args('-device', 'usb-tablet')
+        end
+      end
+
+      @vm = PimQemu::VM.new(command: builder.build, ssh_port: @ssh_port)
+
+      if @console && !@console_log
+        @vm.start_console
+      else
+        @vm.start_background
+      end
 
       output(:info, "VM started (PID: #{@vm.pid})")
       output(:info, "SSH will be available on localhost:#{@ssh_port}")
-      output(:info, "Preseed URL: #{preseed_url}")
-      output(:info, '')
-      output(:info, 'Boot the installer with these parameters:')
-      output(:info, "  auto=true priority=critical preseed/url=#{preseed_url}")
     end
 
     def find_efi_firmware
-      # Common locations for AAVMF/QEMU UEFI firmware
       paths = [
         '/opt/homebrew/share/qemu/edk2-aarch64-code.fd',
         '/usr/local/share/qemu/edk2-aarch64-code.fd',
@@ -209,10 +420,10 @@ module PimBuild
     end
 
     def wait_for_ssh
-      output(:info, 'Waiting for installation to complete and SSH to become available...')
+      output(:info, 'Waiting for SSH to become available...')
       output(:info, "(timeout: #{@config.ssh_timeout}s)")
 
-      success = @vm.wait_for_ssh(timeout: @config.ssh_timeout, poll_interval: 30) do |attempt, remaining|
+      success = @vm.wait_for_ssh(timeout: @config.ssh_timeout, poll_interval: 10) do |attempt, remaining|
         output(:progress, "Attempt #{attempt}, #{remaining}s remaining...")
       end
 
@@ -222,7 +433,6 @@ module PimBuild
 
       output(:success, 'SSH is available')
 
-      # Additional wait for system to stabilize
       sleep 5
     end
 
@@ -244,12 +454,11 @@ module PimBuild
         script_name = File.basename(script_path)
         output(:info, "[#{index + 1}/#{@scripts.size}] Running #{script_name}")
 
-        # Upload script
         remote_path = "/tmp/pim-script-#{index}.sh"
         ssh.upload(script_path, remote_path)
 
-        # Make executable and run
-        result = ssh.execute("chmod +x #{remote_path} && #{remote_path}", sudo: true)
+        ssh.execute("chmod +x #{remote_path}", sudo: true)
+        result = ssh.execute(remote_path, sudo: true)
 
         if result[:exit_code] != 0
           output(:error, "Script #{script_name} failed (exit code: #{result[:exit_code]})")
@@ -273,20 +482,11 @@ module PimBuild
         password: @profile.data['password']
       )
 
-      # Clean cloud-init if present
       ssh.execute('cloud-init clean --logs 2>/dev/null || true', sudo: true)
-
-      # Truncate machine-id for unique ID on first boot
       ssh.execute('truncate -s 0 /etc/machine-id', sudo: true)
-
-      # Clean apt cache
       ssh.execute('apt-get clean 2>/dev/null || true', sudo: true)
-
-      # Clear logs
       ssh.execute('find /var/log -type f -exec truncate -s 0 {} \\; 2>/dev/null || true', sudo: true)
-
-      # Remove SSH host keys (regenerated on first boot)
-      ssh.execute('rm -f /etc/ssh/ssh_host_* 2>/dev/null || true', sudo: true)
+      ssh.execute('rm -f /etc/ssh/ssh_host_* && dpkg-reconfigure openssh-server', sudo: true)
 
       output(:success, 'Image finalized')
     end
@@ -316,6 +516,14 @@ module PimBuild
       output(:success, 'VM stopped')
     end
 
+    def save_efi_vars(image_path)
+      return unless @efi_vars_path && File.exist?(@efi_vars_path)
+
+      vars_path = image_path.sub(/\.qcow2$/, '-efivars.fd')
+      FileUtils.cp(@efi_vars_path, vars_path)
+      output(:info, "EFI vars saved: #{File.basename(vars_path)}")
+    end
+
     def register_image(image_path, cache_key)
       output(:info, 'Registering image in registry')
 
@@ -334,12 +542,12 @@ module PimBuild
     end
 
     def cleanup
-      # Stop server thread
+      FileUtils.rm_rf(@kernel_dir) if @kernel_dir
+
       if @server_thread&.alive?
         Thread.kill(@server_thread)
       end
 
-      # Kill VM if still running
       if @vm&.running?
         @vm.kill
       end

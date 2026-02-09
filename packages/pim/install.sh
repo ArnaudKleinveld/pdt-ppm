@@ -10,7 +10,7 @@ install_linux() {
 }
 
 install_macos() {
-  install_dep qemu tiger-vnc
+  install_dep qemu socat
 }
 
 post_install() {

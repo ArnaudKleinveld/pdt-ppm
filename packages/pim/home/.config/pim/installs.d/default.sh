@@ -7,13 +7,14 @@ set -ex
 echo "=== Post-installation script starting ==="
 # Add custom post-installation commands here
 
-# export DEBIAN_FRONTEND=noninteractive
-# apt-get update || true
+export DEBIAN_FRONTEND=noninteractive
+apt-get update || true
 # apt-get install -y zsh htop
 
 cat > /home/ansible/ppm.sh << 'EOF'
+export PPM_SSH_AUTHORIZED_KEYS_URL=https://github.com/rjayroach.keys
 export PPM_INSTALL_REPO=git@github.com:maxcole/rjayroach-ppm
-export PPM_INSTALL_PACKAGES="chorus claude git nvim ssh tmux zsh"
+export PPM_INSTALL_PACKAGES="chorus ruby-tools claude git nvim ssh tmux zsh"
 curl -fsSL https://raw.githubusercontent.com/maxcole/ppm/refs/heads/main/install.sh | bash
 EOF
 

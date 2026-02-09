@@ -49,7 +49,7 @@ module PimSSH
     def execute(command, sudo: false)
       full_command = sudo ? "sudo #{command}" : command
 
-      result = { stdout: '', stderr: '', exit_code: nil }
+      result = { stdout: String.new, stderr: String.new, exit_code: nil }
 
       Net::SSH.start(@host, @user, @options.merge(port: @port)) do |ssh|
         channel = ssh.open_channel do |ch|

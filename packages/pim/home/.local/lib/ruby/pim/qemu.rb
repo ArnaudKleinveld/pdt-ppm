@@ -2,6 +2,7 @@
 
 require 'open3'
 require 'json'
+require 'pty'
 require 'timeout'
 require 'socket'
 
@@ -91,11 +92,12 @@ module PimQemu
 
   # QEMU command builder for different architectures
   class CommandBuilder
-    def initialize(arch:, memory: 2048, cpus: 2, display: false)
+    def initialize(arch:, memory: 2048, cpus: 2, display: false, serial: nil)
       @arch = arch
       @memory = memory
       @cpus = cpus
       @display = display
+      @serial = serial
       @drives = []
       @cdrom = nil
       @netdevs = []
@@ -174,8 +176,10 @@ module PimQemu
         end
       end
 
-      # Serial console for nographic mode
-      unless @display
+      # Serial console
+      if @serial
+        cmd += ['-serial', @serial]
+      elsif !@display
         cmd += ['-serial', 'mon:stdio']
       end
 
@@ -279,14 +283,47 @@ module PimQemu
     end
 
     # Start VM in background and return immediately
-    def start_background
+    def start_background(detach: true)
       @pid = spawn(*@command, [:out, :err] => '/dev/null')
-      Process.detach(@pid)
+      Process.detach(@pid) if detach
+      @detached = detach
 
-      # Give QEMU a moment to start
       sleep 2
-
       self
+    end
+
+    # Start VM with serial output going directly to the terminal
+    def start_console(detach: true)
+      @pid = spawn(*@command)
+      Process.detach(@pid) if detach
+      @detached = detach
+
+      sleep 2
+      self
+    end
+
+    # Wait for VM process to exit (only works when started with detach: false)
+    def wait_for_exit(timeout: 3600, poll_interval: 10)
+      deadline = Time.now + timeout
+
+      while Time.now < deadline
+        begin
+          pid, status = Process.waitpid2(@pid, Process::WNOHANG)
+          if pid
+            @pid = nil
+            return status.exitstatus || 0
+          end
+        rescue Errno::ECHILD
+          @pid = nil
+          return 0
+        end
+
+        remaining = (deadline - Time.now).to_i
+        yield(remaining) if block_given?
+        sleep(poll_interval)
+      end
+
+      nil
     end
 
     # Check if VM is running
@@ -334,7 +371,7 @@ module PimQemu
       end
     end
 
-    # Wait for SSH port to be available
+    # Wait for SSH port to be available (verifies SSH banner, not just TCP)
     def wait_for_ssh(timeout: 1800, poll_interval: 10, &block)
       return false unless @ssh_port
 
@@ -345,13 +382,21 @@ module PimQemu
         attempt += 1
         begin
           socket = TCPSocket.new('127.0.0.1', @ssh_port)
-          socket.close
-          return true
-        rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT
-          remaining = (deadline - Time.now).to_i
-          block.call(attempt, remaining) if block_given?
-          sleep(poll_interval)
+          ready = IO.select([socket], nil, nil, 10)
+          if ready
+            banner = socket.gets
+            socket.close
+            return true if banner&.start_with?('SSH-')
+          else
+            socket.close
+          end
+        rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::ECONNRESET, IOError
+          # Port not ready yet
         end
+
+        remaining = (deadline - Time.now).to_i
+        block.call(attempt, remaining) if block_given?
+        sleep(poll_interval)
       end
 
       false

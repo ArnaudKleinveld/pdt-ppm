@@ -161,10 +161,6 @@ module PimIso
       end
     end
 
-    def config
-      puts "iso_dir: #{iso_dir}"
-    end
-
     def download(key, force: false)
       unless isos[key]
         puts "Error: ISO '#{key}' not found in catalog"
@@ -340,13 +336,16 @@ module PimIso
           size = filepath.size
           total_bytes += size
           size_str = format_bytes(size).rjust(10)
-          status = iso_verified?(key) ? colorize('verified', :green) : colorize('downloaded', :yellow)
+          verified = iso_verified?(key)
+          status = verified ? colorize('verified', :green) : colorize('downloaded', :yellow)
+          path_col = verified ? "  #{filepath}" : ''
         else
           size_str = '-'.rjust(10)
           status = colorize('missing', :red)
+          path_col = ''
         end
 
-        puts "#{key.ljust(max_name_len)}  #{size_str}  #{status}"
+        puts "#{key.ljust(max_name_len)}  #{size_str}  #{status}#{path_col}"
       end
 
       puts
@@ -579,11 +578,6 @@ module PimIso
     desc 'add', 'Add a new ISO to the catalog interactively'
     def add
       manager.add
-    end
-
-    desc 'config', 'Show ISO configuration'
-    def config
-      manager.config
     end
 
     private

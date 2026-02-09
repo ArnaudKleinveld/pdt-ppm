@@ -10,6 +10,7 @@ require 'pathname'
 require 'fileutils'
 
 # Load subcommand libraries
+require 'pim/config'
 require 'pim/iso'
 require 'pim/profile'
 require 'pim/ventoy'
@@ -289,25 +290,8 @@ module Pim
       server.start
     end
 
-    desc 'config', 'Show pim configuration'
-    def config
-      pim_config = Config.new
-
-      puts "Configuration"
-      puts
-      puts "ISO:"
-      puts "  iso_dir: #{pim_config.iso_config.iso_dir}"
-      puts
-      puts "Serve:"
-      serve_defaults = pim_config.serve_defaults
-      if serve_defaults.empty?
-        puts "  (no defaults)"
-      else
-        serve_defaults.each do |key, value|
-          puts "  #{key}: #{value}"
-        end
-      end
-    end
+    desc 'config SUBCOMMAND', 'Manage pim configuration'
+    subcommand 'config', PimConfig::CLI
 
     desc 'iso SUBCOMMAND', 'ISO management commands'
     subcommand 'iso', PimIso::CLI

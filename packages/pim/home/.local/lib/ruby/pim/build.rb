@@ -296,6 +296,9 @@ module PimBuild
     option :arch, type: :string, aliases: '-a', desc: 'Target architecture (arm64, x86_64)'
     option :force, type: :boolean, default: false, aliases: '-f', desc: 'Force rebuild ignoring cache'
     option :dry_run, type: :boolean, default: false, aliases: '-n', desc: 'Show what would be done'
+    option :vnc, type: :numeric, default: nil, desc: 'Enable VNC display on port 5900+N (e.g. --vnc 0)'
+    option :console, type: :boolean, default: false, aliases: '-c', desc: 'Stream serial console output to stdout'
+    option :console_log, type: :string, default: nil, desc: 'Log serial console to file'
     def run_build(profile_name)
       require_relative 'build/manager'
 
@@ -305,7 +308,14 @@ module PimBuild
       if options[:dry_run]
         manager.dry_run(profile_name, arch: arch)
       else
-        manager.build(profile_name, arch: arch, force: options[:force])
+        manager.build(
+          profile_name,
+          arch: arch,
+          force: options[:force],
+          vnc: options[:vnc],
+          console: options[:console],
+          console_log: options[:console_log]
+        )
       end
     end
     map 'run' => :run_build

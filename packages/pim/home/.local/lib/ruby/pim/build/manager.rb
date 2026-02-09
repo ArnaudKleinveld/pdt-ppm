@@ -17,7 +17,7 @@ module PimBuild
     end
 
     # Execute a build
-    def build(profile_name, arch:, force: false)
+    def build(profile_name, arch:, force: false, vnc: nil, console: false, console_log: nil)
       profile_name = profile_name.to_s
       arch = @resolver.normalize(arch)
 
@@ -57,6 +57,9 @@ module PimBuild
       puts "ISO:        #{iso_key}"
       puts "Scripts:    #{script_names.join(', ')}"
       puts "Cache key:  #{cache_key}"
+      puts "VNC:        :#{vnc} (localhost:#{5900 + vnc})" if vnc
+      puts "Console:    stdout" if console && !console_log
+      puts "Console:    #{console_log}" if console_log
       puts
 
       # Check cache
@@ -78,7 +81,10 @@ module PimBuild
           iso_key: iso_key,
           iso_path: iso_path,
           cache_key: cache_key,
-          scripts: scripts
+          scripts: scripts,
+          vnc: vnc,
+          console: console,
+          console_log: console_log
         )
       when :remote
         remote_build(
@@ -277,7 +283,8 @@ module PimBuild
       @script_loader.resolve_scripts(script_names)
     end
 
-    def local_build(profile:, profile_name:, arch:, iso_key:, iso_path:, cache_key:, scripts:)
+    def local_build(profile:, profile_name:, arch:, iso_key:, iso_path:, cache_key:, scripts:,
+                     vnc: nil, console: false, console_log: nil)
       builder = LocalBuilder.new(
         config: @config,
         profile: profile,
@@ -287,7 +294,7 @@ module PimBuild
         iso_key: iso_key
       )
 
-      builder.build(cache_key: cache_key, scripts: scripts)
+      builder.build(cache_key: cache_key, scripts: scripts, vnc: vnc, console: console, console_log: console_log)
     end
 
     def remote_build(builder_info:, profile:, profile_name:, arch:, iso_key:, cache_key:, scripts:)
